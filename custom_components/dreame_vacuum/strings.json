@@ -211,6 +211,7 @@
     "bridge_read_mode": {
       "options": {
         "passive": "Passive telemetry only",
+        "on_demand_refresh": "On-demand state refresh",
         "durable_refresh": "Durable state refresh",
         "legacy": "Legacy individual reads",
         "state_refresh": "Bounded state refresh",
@@ -2735,7 +2736,7 @@
       "fields": {
         "config_entry_id": {
           "name": "Local MQTT Bridge entry",
-          "description": "The ID of the loaded bridge entry configured for bounded state refresh."
+          "description": "The ID of the loaded bridge entry configured for on-demand or bounded state refresh."
         }
       }
     },

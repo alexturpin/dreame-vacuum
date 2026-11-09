@@ -99,6 +99,41 @@ memory. Reload, shutdown, session change, invalid replies and timing
 failures end the active run. The integration does not recover a lost
 capability or start another run automatically.
 
+### On-demand state refresh (recommended for persistent local use)
+
+Select **On-demand state refresh** with pinned HTTPS and an owner explicitly
+installed with the matching `on_demand_refresh` policy. This is a different
+policy from the temporary trial grants: an authenticated direct HA administrator
+action can request one snapshot without a separate root arm.
+
+Call `dreame_vacuum.refresh_local_state` with `config_entry_id` and response
+handling from Developer Tools. The action returns acceptance/progress; watch
+**Local state refresh run** for completion and **Local state refresh** for the
+result. Do not retry an ambiguous action response. The existing start-run action
+is an alias for the same single cycle in this mode. Internal/automation contexts
+and non-administrator users are refused.
+
+Each action allows exactly the five ordered state properties, at most five
+seconds per read and 45 seconds per cycle. The owner issues a volatile claim
+valid for at most 60 seconds and permits no second cycle. Failed/lost replies
+end the cycle with no retry or partial publication. Allow at least 120 seconds
+between refresh starts in the same owner epoch. The owner also bounds consumed
+claim identities to 1,024 per epoch; reaching that limit requires an operator to
+review and restart the owner, not an automatic reset.
+
+The vacuum uses only the complete solicited snapshot. It expires 60 seconds
+from the first request, becoming unavailable until the next explicit refresh.
+The native passive feed remains independent; no battery read is included.
+Setup, passive GET polling, reconnects and process recovery never initiate
+property reads. Restart/reload discards in-flight work and snapshot state.
+All local vacuum controls remain disabled, including generic send-command.
+
+The persistent policy is deployment configuration; it survives restart. A local
+root disarm disables further claims for the lifetime of the owner process,
+including reconnects. To keep access disabled across restarts, stop/disable
+command ingress and restore the passive owner configuration. Deployment and
+robot testing require their own explicit scope approval.
+
 ### Durable state refresh
 
 Select **Durable state refresh** with pinned HTTPS for a matching

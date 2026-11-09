@@ -62,9 +62,11 @@ READ_MODE_LEGACY = "legacy"
 READ_MODE_STATE_REFRESH = "state_refresh"
 READ_MODE_STATE_REFRESH_RUN = "state_refresh_run"
 READ_MODE_DURABLE_REFRESH = "durable_refresh"
-_RUN_MODES = (READ_MODE_STATE_REFRESH_RUN, READ_MODE_DURABLE_REFRESH)
+READ_MODE_ON_DEMAND = "on_demand_refresh"
+_RUN_MODES = (READ_MODE_STATE_REFRESH_RUN, READ_MODE_DURABLE_REFRESH, READ_MODE_ON_DEMAND)
 BRIDGE_READ_MODES = (
     READ_MODE_PASSIVE,
+    READ_MODE_ON_DEMAND,
     READ_MODE_DURABLE_REFRESH,
     READ_MODE_LEGACY,
     READ_MODE_STATE_REFRESH,
@@ -431,8 +433,8 @@ class LocalBridgeClient:
             "claim", epoch, run_id, {"mode": mode, "revoke_secret": revoke_secret}, timeout
         )
         limits = {
-            "max_cycles": _RUN_MAX_CYCLES,
-            "max_reads": _RUN_MAX_READS,
+            "max_cycles": 1 if self._read_mode == READ_MODE_ON_DEMAND else _RUN_MAX_CYCLES,
+            "max_reads": 5 if self._read_mode == READ_MODE_ON_DEMAND else _RUN_MAX_READS,
             "min_cycle_interval_seconds": _RUN_MIN_INTERVAL,
             "cycle": 1,
         }
@@ -441,7 +443,7 @@ class LocalBridgeClient:
             or response["mode"] != mode
             or any(type(response[key]) is not int or response[key] != value for key, value in limits.items())
             or type(response["remaining_grant_ms"]) is not int
-            or not 0 < response["remaining_grant_ms"] <= _RUN_MAX_SECONDS * 1000
+            or not 0 < response["remaining_grant_ms"] <= (60 if mode == READ_MODE_ON_DEMAND else _RUN_MAX_SECONDS) * 1000
             or not _is_hex_id(response["cycle_capability"])
         ):
             raise LocalBridgeError("Invalid bridge refresh run claim response")
@@ -489,8 +491,9 @@ class LocalBridgeClient:
         last = address == _READ_PROPERTIES["error"]
         receipt = response["continuation"]
         next_cycle = response["next_cycle_capability"]
+        max_cycles = 1 if self._read_mode == READ_MODE_ON_DEMAND else _RUN_MAX_CYCLES
         if (receipt is not None if last else not _is_hex_id(receipt)) or (
-            not _is_hex_id(next_cycle) if last and cycle < _RUN_MAX_CYCLES else next_cycle is not None
+            not _is_hex_id(next_cycle) if last and cycle < max_cycles else next_cycle is not None
         ):
             raise LocalBridgeError("Invalid bridge refresh run capability placement")
         return item["value"], receipt, next_cycle
@@ -553,7 +556,7 @@ class LocalBridgeCoordinator(DataUpdateCoordinator[DreameVacuumDevice]):
         self._run_progress = {
             "state": "inactive",
             "completed_cycles": 0,
-            "max_cycles": _RUN_MAX_CYCLES,
+            "max_cycles": 1 if self._read_mode == READ_MODE_ON_DEMAND else _RUN_MAX_CYCLES,
             "next_due_at": None,
             "expires_at": None,
             "reason": None,
@@ -573,7 +576,7 @@ class LocalBridgeCoordinator(DataUpdateCoordinator[DreameVacuumDevice]):
 
     @property
     def durable_refresh_enabled(self) -> bool:
-        return self._read_mode == READ_MODE_DURABLE_REFRESH
+        return self._read_mode in (READ_MODE_DURABLE_REFRESH, READ_MODE_ON_DEMAND)
 
     @property
     def refresh_run_progress(self) -> dict[str, Any]:
@@ -940,7 +943,7 @@ class LocalBridgeCoordinator(DataUpdateCoordinator[DreameVacuumDevice]):
 
     async def async_prepare_refresh_run(self) -> dict[str, str]:
         """Create a volatile run binding for an independent owner-side arm."""
-        if not self.durable_refresh_enabled:
+        if self._read_mode != READ_MODE_DURABLE_REFRESH:
             raise LocalBridgeError("Preparing a refresh run requires the durable refresh bridge mode")
         entry = self.config_entry
         if self._closed or self.hass.is_stopping or entry.state is not ConfigEntryState.LOADED:
@@ -994,7 +997,15 @@ class LocalBridgeCoordinator(DataUpdateCoordinator[DreameVacuumDevice]):
             raise LocalBridgeError("The local bridge is busy")
 
         clock = self.hass.loop.time
-        if self.durable_refresh_enabled:
+        if self._read_mode == READ_MODE_ON_DEMAND:
+            if self._run is not None or self._run_abort_task is not None:
+                raise LocalBridgeError("The local bridge is busy")
+            epoch = self._epoch
+            if epoch is None or not self.device.available:
+                raise LocalBridgeError("The local bridge has no fresh telemetry")
+            run = _RefreshRun(epoch, token_hex(16), token_hex(16), current_task())
+            self._clear_refresh_snapshot()
+        elif self.durable_refresh_enabled:
             if self._run is not None or self._run_abort_task is not None:
                 raise LocalBridgeError("The local bridge is busy")
             if self._prepared_run is None:
@@ -1074,7 +1085,8 @@ class LocalBridgeCoordinator(DataUpdateCoordinator[DreameVacuumDevice]):
         due = None
         try:
             async with timeout_at(run.deadline):
-                for cycle in range(1, _RUN_MAX_CYCLES + 1):
+                max_cycles = 1 if self._read_mode == READ_MODE_ON_DEMAND else _RUN_MAX_CYCLES
+                for cycle in range(1, max_cycles + 1):
                     if due is not None:
                         await sleep(max(0, due - clock()))
                     now = self._require_refresh_run(run, run.deadline)
@@ -1098,7 +1110,7 @@ class LocalBridgeCoordinator(DataUpdateCoordinator[DreameVacuumDevice]):
                         if not self._closed and self.config_entry.state is ConfigEntryState.LOADED:
                             self.async_set_updated_data(self.device)
                     self._run_progress["completed_cycles"] = cycle
-                    if cycle == _RUN_MAX_CYCLES:
+                    if cycle == max_cycles:
                         self._end_refresh_run(run, "completed")
                         return
                     due = completed_at + _RUN_INTERVAL
@@ -1204,7 +1216,10 @@ def async_register_local_read(hass: HomeAssistant) -> None:
         return {"property": property_name, **result}
 
     async def async_refresh_local_state(call: ServiceCall) -> dict[str, Any]:
-        return await get_coordinator(call).async_refresh_local_state()
+        coordinator = get_coordinator(call)
+        if coordinator._read_mode == READ_MODE_ON_DEMAND:
+            return await get_run_coordinator(call).async_start_refresh_run()
+        return await coordinator.async_refresh_local_state()
 
     def get_run_coordinator(call: ServiceCall) -> LocalBridgeCoordinator:
         # The admin service helper also admits internal contexts without a user.
