@@ -5,3 +5,10 @@
 /env
 *.zip
 .idea
+
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.env
+*.key

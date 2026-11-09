@@ -17,8 +17,15 @@ from homeassistant.const import (
 )
 from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult, AbortFlow, UnknownFlow
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.device_registry import format_mac
-from homeassistant.helpers.selector import SelectSelector, SelectSelectorConfig
+from homeassistant.helpers.selector import (
+    SelectSelector,
+    SelectSelectorConfig,
+    TextSelector,
+    TextSelectorConfig,
+    TextSelectorType,
+)
 from homeassistant.config_entries import (
     ConfigEntry,
     ConfigFlow,
@@ -48,6 +55,17 @@ from .const import (
     NOTIFICATION,
 )
 
+from .local_bridge import (
+    ACCOUNT_TYPE_LOCAL_BRIDGE,
+    CONF_BRIDGE_FINGERPRINT,
+    CONF_BRIDGE_TOKEN,
+    CONF_BRIDGE_URL,
+    LocalBridgeClient,
+    LocalBridgeError,
+    is_local_bridge,
+    validate_bridge_url,
+)
+
 COLOR_SCHEME_KEYS = {name.lower().replace(" ", "_"): name for name in MAP_COLOR_SCHEME_LIST}
 ICON_SET_KEYS = {name.lower().replace(" ", "_"): name for name in MAP_ICON_SET_LIST}
 
@@ -71,6 +89,7 @@ ACCOUNT_TYPES = [
     ACCOUNT_TYPE_MOVA,
     ACCOUNT_TYPE_TROUVER,
     ACCOUNT_TYPE_LOCAL,
+    ACCOUNT_TYPE_LOCAL_BRIDGE,
 ]
 
 
@@ -83,6 +102,8 @@ class DreameVacuumOptionsFlowHandler(OptionsFlow):
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         """Manage Dreame Vacuum options."""
+        if is_local_bridge(self._config_entry.data):
+            return self.async_abort(reason="local_bridge_reconfigure")
         errors = {}
         dvc = frontend is not None or bool(self._config_entry.options.get(CONF_DVC_KEY))
         if user_input is not None:
@@ -240,6 +261,9 @@ class DreameVacuumFlowHandler(ConfigFlow, domain=DOMAIN):
 
     async def async_step_reauth(self, user_input: Mapping[str, Any]) -> FlowResult:
         """Perform reauth upon an authentication error or missing cloud credentials."""
+        if is_local_bridge(user_input):
+            self.entry = self._get_reauth_entry()
+            return await self.async_step_local_bridge()
         self.name = user_input[CONF_NAME]
         self.host = user_input[CONF_HOST]
         self.token = user_input[CONF_TOKEN]
@@ -364,7 +388,67 @@ class DreameVacuumFlowHandler(ConfigFlow, domain=DOMAIN):
             errors=errors,
         )
 
+    async def async_step_reconfigure(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Edit local bridge connection settings."""
+        self.entry = self._get_reconfigure_entry()
+        if not is_local_bridge(self.entry.data):
+            return self.async_abort(reason="reconfigure_unavailable")
+        return await self.async_step_local_bridge(user_input)
+
+    async def async_step_local_bridge(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Configure a bridge without connecting to the robot or a cloud account."""
+        errors = {}
+        if user_input is not None:
+            name = user_input[CONF_NAME].strip()
+            try:
+                data = {
+                    CONF_ACCOUNT_TYPE: ACCOUNT_TYPE_LOCAL_BRIDGE,
+                    CONF_NAME: vol.Length(min=1, max=100)(name),
+                    CONF_BRIDGE_URL: str(validate_bridge_url(user_input[CONF_BRIDGE_URL])),
+                    CONF_BRIDGE_TOKEN: user_input[CONF_BRIDGE_TOKEN].strip(),
+                    CONF_BRIDGE_FINGERPRINT: user_input.get(CONF_BRIDGE_FINGERPRINT, "").strip(),
+                }
+                bridge = LocalBridgeClient(async_get_clientsession(self.hass), data)
+            except (ValueError, vol.Invalid):
+                errors["base"] = "invalid_bridge_settings"
+            else:
+                if self.entry is None or data[CONF_BRIDGE_URL] != self.entry.data[CONF_BRIDGE_URL]:
+                    self._async_abort_entries_match({CONF_BRIDGE_URL: data[CONF_BRIDGE_URL]})
+                try:
+                    await bridge.async_get_state()
+                except LocalBridgeError:
+                    errors["base"] = "cannot_connect_bridge"
+                else:
+                    unique_id = f"bridge:{data[CONF_BRIDGE_URL]}"
+                    if self.entry is not None:
+                        return self.async_update_reload_and_abort(
+                            self.entry, title=name, data=data, unique_id=unique_id
+                        )
+                    await self.async_set_unique_id(unique_id)
+                    self._abort_if_unique_id_configured()
+                    return self.async_create_entry(title=name, data=data)
+
+        defaults = self.entry.data if self.entry is not None else {}
+        return self.async_show_form(
+            step_id="local_bridge",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_NAME, default=defaults.get(CONF_NAME, "Dreame Vacuum")): str,
+                    vol.Required(CONF_BRIDGE_URL, default=defaults.get(CONF_BRIDGE_URL, "")): str,
+                    vol.Required(CONF_BRIDGE_TOKEN): TextSelector(
+                        TextSelectorConfig(type=TextSelectorType.PASSWORD)
+                    ),
+                    vol.Optional(
+                        CONF_BRIDGE_FINGERPRINT, default=defaults.get(CONF_BRIDGE_FINGERPRINT, "")
+                    ): str,
+                }
+            ),
+            errors=errors,
+        )
+
     async def async_step_login(self, error=None):
+        if self.account_type == ACCOUNT_TYPE_LOCAL_BRIDGE:
+            return await self.async_step_local_bridge()
         if self.account_type == ACCOUNT_TYPE_MI:
             return await self.async_step_mi(error=error)
         if self.account_type == ACCOUNT_TYPE_DREAME:

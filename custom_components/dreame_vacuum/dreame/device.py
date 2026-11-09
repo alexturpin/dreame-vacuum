@@ -337,6 +337,8 @@ class DreameVacuumDevice:
         account_type: str = "mi",
         device_id: str = None,
         auth_key: str = None,
+        *,
+        local_bridge: bool = False,
     ) -> None:
         # Used for easy filtering the device from cloud device list and generating unique ids
         self.info = None
@@ -386,6 +388,7 @@ class DreameVacuumDevice:
         self._discard_timeout = 5
         self._restore_timeout = 15
 
+        self._local_bridge = local_bridge
         self._name = name
         self.mac = mac
         self.token = token
@@ -394,6 +397,12 @@ class DreameVacuumDevice:
         self.account_type = account_type
         self.status = DreameVacuumDeviceStatus(self)
         self.capability = DreameVacuumDeviceCapability(self)
+
+        if self._local_bridge:
+            self._protocol = None
+            self._default_properties = []
+            self.action_mapping = {}
+            return
 
         # Remove write only and response only properties from default list
         self._default_properties = list(
@@ -535,6 +544,18 @@ class DreameVacuumDevice:
             )
             self._map_manager.listen(self._map_changed, self._map_updated)
             self._map_manager.listen_error(self._update_failed)
+
+    def apply_local_bridge_properties(self, properties: dict[int, int]) -> None:
+        """Replace the complete property cache with a validated bridge snapshot."""
+        if not self._local_bridge:
+            raise RuntimeError("Local bridge properties require a local bridge device")
+        self.data.clear()
+        self.data.update(properties)
+        self.available = bool(self.data)
+
+    def _require_writable_protocol(self) -> None:
+        if self._local_bridge:
+            raise InvalidActionException("Local MQTT Bridge is read-only")
 
     def _connected_callback(self):
         if not self._ready or self._last_update_failed is not None:
@@ -834,6 +855,8 @@ class DreameVacuumDevice:
 
     def _request_properties(self, properties: list[DreameVacuumProperty] = None) -> bool:
         """Request properties from the device."""
+        if self._local_bridge:
+            return False
         if not properties:
             properties = self._default_properties
             if not self._ready or (self.capability.loaded and not self.capability.dock_status):
@@ -919,6 +942,7 @@ class DreameVacuumDevice:
 
     def _update_property(self, prop: DreameVacuumProperty, value: Any, delay=True) -> Any:
         """Update device property on memory and notify listeners."""
+        self._require_writable_protocol()
         if prop in self.property_mapping:
             if (
                 not self.capability.new_state
@@ -2501,6 +2525,7 @@ class DreameVacuumDevice:
 
     def connect_device(self) -> None:
         """Connect to the device api."""
+        self._require_writable_protocol()
         _LOGGER.info("Connecting to device")
         info = self._protocol.connect(self._message_callback, self._connected_callback)
         if info:
@@ -2575,6 +2600,8 @@ class DreameVacuumDevice:
 
     def connect_cloud(self) -> None:
         """Connect to the cloud api."""
+        if self._local_bridge:
+            return
         if self._protocol.cloud and not self._protocol.cloud.logged_in:
             self._protocol.cloud.login()
             self.auth_failed = False
@@ -2595,6 +2622,9 @@ class DreameVacuumDevice:
         """Disconnect from device and cancel timers"""
         _LOGGER.info("Disconnect")
         self.disconnected = True
+        if self._local_bridge:
+            self.apply_local_bridge_properties({})
+            return
         self.schedule_update(-1)
         if self._update_timer is not None:
             self._update_timer.stop()
@@ -2632,6 +2662,8 @@ class DreameVacuumDevice:
 
     def schedule_update(self, wait: float = None, force_request_properties=False) -> None:
         """Schedule a device update for future"""
+        if self._local_bridge:
+            return
         if wait == None:
             wait = self._update_interval
 
@@ -2690,6 +2722,7 @@ class DreameVacuumDevice:
         return None
 
     def set_property_value(self, prop: str, value: Any = None, params: Any = None):
+        self._require_writable_protocol()
         if prop is not None and value is not None:
             set_fn = "set_" + prop.lower()
             if hasattr(self, set_fn):
@@ -2966,6 +2999,7 @@ class DreameVacuumDevice:
         raise InvalidActionException(key="invalid_value", parameter="property", value=prop)
 
     def call_action_value(self, action: str, params: None):
+        self._require_writable_protocol()
         if action is not None:
             if hasattr(self, action) and not action.startswith("_"):
                 action_fn = getattr(self, action)
@@ -3007,6 +3041,7 @@ class DreameVacuumDevice:
         """Sets property value using the existing property mapping and notify listeners
         Property must be set on memory first and notify its listeners because device does not return new value immediately.
         """
+        self._require_writable_protocol()
         if value is None:
             return False
 
@@ -3060,6 +3095,7 @@ class DreameVacuumDevice:
 
     def set_properties(self, properties: dict) -> bool:
         """Sets multiple properties at once using the existing property mapping and notify listeners"""
+        self._require_writable_protocol()
         if not properties:
             return True
 
@@ -3556,6 +3592,8 @@ class DreameVacuumDevice:
 
     def update(self, force_request_properties=False) -> None:
         """Get properties from the device."""
+        if self._local_bridge:
+            return
         _LOGGER.debug("Device update: %s", self._update_interval)
 
         if not self.cloud_connected:
@@ -3823,6 +3861,7 @@ class DreameVacuumDevice:
 
     def call_action(self, action: DreameVacuumAction, parameters: dict[str, Any] = None) -> dict[str, Any] | None:
         """Call an action."""
+        self._require_writable_protocol()
         if action not in self.action_mapping:
             raise InvalidActionException(key="unknown_action", action=action)
 
@@ -4052,6 +4091,7 @@ class DreameVacuumDevice:
         """Send a raw command to the device. This is mostly useful when trying out
         commands which are not implemented by a given device instance. (Not likely)"""
 
+        self._require_writable_protocol()
         if (
             command == "" or command in INVALID_COMMANDS
         ):  ## Commands for other vacuums are unanswered by the device, so they are rejected to prevent timeouts.
@@ -4477,6 +4517,7 @@ class DreameVacuumDevice:
 
     def start(self) -> dict[str, Any] | None:
         """Start or resume the cleaning task."""
+        self._require_writable_protocol()
         properties = self.get_status_properties()
         if self.status.fast_mapping_paused:
             self._update_status(DreameVacuumTaskStatus.FAST_MAPPING, DreameVacuumStatus.FAST_MAPPING)
@@ -6074,6 +6115,7 @@ class DreameVacuumDevice:
     def set_ai_property(
         self, prop: DreameVacuumStrAIProperty | DreameVacuumAIProperty, value: bool
     ) -> dict[str, Any] | None:
+        self._require_writable_protocol()
         if self.capability.ai_detection:
             if prop.name not in self.ai_data:
                 raise NotSupportedException(feature="ai_property")
@@ -6112,6 +6154,7 @@ class DreameVacuumDevice:
     def set_auto_switch_property(
         self, prop: DreameVacuumAutoSwitchProperty, value: int, sync=True
     ) -> dict[str, Any] | None:
+        self._require_writable_protocol()
         if self.capability.auto_switch_settings:
             if prop.name not in self.auto_switch_data:
                 raise NotSupportedException(feature="ai_property")
@@ -7959,11 +8002,15 @@ class DreameVacuumDevice:
     @property
     def device_connected(self) -> bool:
         """Return connection status of the device."""
+        if self._local_bridge:
+            return self.available
         return self._protocol.connected
 
     @property
     def cloud_connected(self) -> bool:
         """Return connection status of the device."""
+        if self._local_bridge:
+            return False
         return (
             self._protocol.cloud
             and self._protocol.cloud.connected
@@ -8115,9 +8162,11 @@ class DreameVacuumDeviceStatus:
         return self._get_property(DreameVacuumProperty.SERIAL_NUMBER)
 
     @property
-    def battery_level(self) -> int:
+    def battery_level(self) -> int | None:
         """Return battery level of the device."""
         battery_level = self._get_property(DreameVacuumProperty.BATTERY_LEVEL)
+        if self._device._local_bridge:
+            return battery_level
         return int(battery_level) if battery_level else 100
 
     @property
@@ -8391,6 +8440,15 @@ class DreameVacuumDeviceStatus:
     @property
     def state(self) -> DreameVacuumState:
         """Return state of the device."""
+        if self._device._local_bridge:
+            value = self._get_property(DreameVacuumProperty.STATE)
+            if value == 0:
+                return DreameVacuumState.CHARGING_COMPLETED
+            # The higher codes depend on model capabilities that the bridge does not discover.
+            if value is not None and 1 <= value <= DreameVacuumState.RETURNING_REMOVE_MOP:
+                return DreameVacuumState(value)
+            return DreameVacuumState.UNKNOWN
+
         if self.has_error:
             return DreameVacuumState.ERROR
 

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from functools import partial
+
 import voluptuous as vol
 from typing import Final
 
 from .coordinator import DreameVacuumDataUpdateCoordinator
 from .entity import DreameVacuumEntity
+from .local_bridge import LocalBridgeCoordinator, LocalBridgeEntity, is_local_bridge
 
 from dataclasses import dataclass
 from homeassistant.helpers.importlib import async_import_module
@@ -154,17 +157,27 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up a Dreame Vacuum based on a config entry."""
-    coordinator: DreameVacuumDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    # VacuumActivity is only available in newer Home Assistant releases.
+    module = await async_import_module(hass, "homeassistant.components.vacuum")
+    activity_class = getattr(module, "VacuumActivity", None)
+    if is_local_bridge(entry.data):
+        async_add_entities([LocalBridgeVacuum(coordinator, activity_class)])
+        return
 
     platform = entity_platform.current_platform.get()
+    # Legacy services are shared across entries. Read-only entities advertise no features.
+    register_entity_service = partial(
+        platform.async_register_entity_service, required_features=[VacuumEntityFeature.SEND_COMMAND]
+    )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_request_map",
         {},
         DreameVacuum.async_request_map.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_select_map",
         {
             vol.Required("map_id"): cv.positive_int,
@@ -172,7 +185,7 @@ async def async_setup_entry(
         DreameVacuum.async_select_map.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_delete_map",
         {
             vol.Optional("map_id"): cv.positive_int,
@@ -180,19 +193,19 @@ async def async_setup_entry(
         DreameVacuum.async_delete_map.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_save_temporary_map",
         {},
         DreameVacuum.async_save_temporary_map.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_discard_temporary_map",
         {},
         DreameVacuum.async_discard_temporary_map.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_replace_temporary_map",
         {
             vol.Optional("map_id"): cv.positive_int,
@@ -200,7 +213,7 @@ async def async_setup_entry(
         DreameVacuum.async_replace_temporary_map.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_clean_zone",
         {
             vol.Required("zone"): vol.Any(
@@ -230,7 +243,7 @@ async def async_setup_entry(
         DreameVacuum.async_clean_zone.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_clean_segment",
         {
             vol.Required("segments"): vol.Any(vol.Coerce(int), [vol.Coerce(int)]),
@@ -241,7 +254,7 @@ async def async_setup_entry(
         DreameVacuum.async_clean_segment.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_clean_spot",
         {
             vol.Required("points"): vol.Any(
@@ -267,7 +280,7 @@ async def async_setup_entry(
         DreameVacuum.async_clean_spot.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_goto",
         {
             vol.Required("x"): vol.All(vol.Coerce(int)),
@@ -276,7 +289,7 @@ async def async_setup_entry(
         DreameVacuum.async_goto.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_follow_path",
         {
             vol.Optional("points"): vol.All(
@@ -294,7 +307,7 @@ async def async_setup_entry(
         DreameVacuum.async_follow_path.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_start_shortcut",
         {
             vol.Required("shortcut_id"): vol.All(vol.Coerce(int)),
@@ -302,7 +315,7 @@ async def async_setup_entry(
         DreameVacuum.async_start_shortcut.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_set_restricted_zone",
         {
             vol.Optional("walls"): vol.All(
@@ -380,7 +393,7 @@ async def async_setup_entry(
         DreameVacuum.async_set_restricted_zone.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_set_carpet_area",
         {
             vol.Optional("carpets"): vol.Any(
@@ -476,7 +489,7 @@ async def async_setup_entry(
         DreameVacuum.async_set_carpet_area.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_set_carpet_type",
         {
             vol.Required("id"): vol.Any(vol.Coerce(int), [vol.Coerce(int)]),
@@ -486,7 +499,7 @@ async def async_setup_entry(
         DreameVacuum.async_set_carpet_type.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_set_virtual_threshold",
         {
             vol.Optional("virtual_thresholds"): vol.All(
@@ -506,7 +519,7 @@ async def async_setup_entry(
         DreameVacuum.async_set_virtual_threshold.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_set_threshold",
         {
             vol.Optional("passable_thresholds"): vol.All(
@@ -553,7 +566,7 @@ async def async_setup_entry(
         DreameVacuum.async_set_threshold.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_set_predefined_points",
         {
             vol.Optional("points"): vol.All(
@@ -571,7 +584,7 @@ async def async_setup_entry(
         DreameVacuum.async_set_predefined_points.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_remote_control_move_step",
         {
             vol.Required("velocity"): vol.All(vol.Coerce(int), vol.Clamp(min=-600, max=600)),
@@ -581,7 +594,7 @@ async def async_setup_entry(
         DreameVacuum.async_remote_control_move_step.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_install_voice_pack",
         {
             vol.Required("lang_id"): cv.string,
@@ -592,7 +605,7 @@ async def async_setup_entry(
         DreameVacuum.async_install_voice_pack.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_rename_map",
         {
             vol.Required("map_id"): cv.positive_int,
@@ -601,7 +614,7 @@ async def async_setup_entry(
         DreameVacuum.async_rename_map.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_restore_map",
         {
             vol.Required("recovery_map_index"): cv.positive_int,
@@ -610,7 +623,7 @@ async def async_setup_entry(
         DreameVacuum.async_restore_map.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_restore_map_from_file",
         {
             vol.Required("file_url"): cv.url,
@@ -619,7 +632,7 @@ async def async_setup_entry(
         DreameVacuum.async_restore_map_from_file.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_backup_map",
         {
             vol.Optional("map_id"): cv.positive_int,
@@ -627,7 +640,7 @@ async def async_setup_entry(
         DreameVacuum.async_backup_map.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_merge_segments",
         {
             vol.Optional("map_id"): cv.positive_int,
@@ -636,7 +649,7 @@ async def async_setup_entry(
         DreameVacuum.async_merge_segments.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_split_segments",
         {
             vol.Optional("map_id"): cv.positive_int,
@@ -656,7 +669,7 @@ async def async_setup_entry(
         DreameVacuum.async_split_segments.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_rename_segment",
         {
             vol.Required("segment_id"): cv.positive_int,
@@ -665,7 +678,7 @@ async def async_setup_entry(
         DreameVacuum.async_rename_segment.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_set_cleaning_sequence",
         {
             vol.Required("cleaning_sequence"): cv.ensure_list,
@@ -673,7 +686,7 @@ async def async_setup_entry(
         DreameVacuum.async_set_cleaning_sequence.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_set_custom_cleaning",
         {
             vol.Required("segment_id"): cv.ensure_list,
@@ -690,7 +703,7 @@ async def async_setup_entry(
         DreameVacuum.async_set_custom_cleaning.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_set_custom_carpet_cleaning",
         {
             vol.Required("id"): vol.Any(vol.Coerce(int), [vol.Coerce(int)]),
@@ -703,7 +716,7 @@ async def async_setup_entry(
         DreameVacuum.async_set_custom_carpet_cleaning.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_set_segment_type",
         {
             vol.Required("type"): vol.Any(dict[str, list[int]]),
@@ -712,7 +725,7 @@ async def async_setup_entry(
         DreameVacuum.async_set_segment_type.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_set_hidden_segments",
         {
             vol.Optional("segments"): vol.All(list, [vol.Coerce(int)]),
@@ -721,7 +734,7 @@ async def async_setup_entry(
         DreameVacuum.async_set_hidden_segments.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_set_floor_material",
         {
             vol.Required("material"): vol.Any(dict[str, list[int]]),
@@ -730,7 +743,7 @@ async def async_setup_entry(
         DreameVacuum.async_set_floor_material.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_set_low_lying_area",
         {
             vol.Optional("area"): vol.All(
@@ -750,7 +763,7 @@ async def async_setup_entry(
         DreameVacuum.async_set_low_lying_area.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_set_furniture",
         {
             vol.Optional("furnitures"): vol.All(
@@ -777,7 +790,7 @@ async def async_setup_entry(
         DreameVacuum.async_set_furniture.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_set_curtain",
         {
             vol.Optional("curtains"): vol.All(
@@ -797,7 +810,7 @@ async def async_setup_entry(
         DreameVacuum.async_set_curtain.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_set_mop_type",
         {
             vol.Required("mop_type"): vol.Any(dict[str, str]),
@@ -806,7 +819,7 @@ async def async_setup_entry(
         DreameVacuum.async_set_mop_type.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_reset_consumable",
         {
             vol.Required("consumable"): vol.In(
@@ -835,7 +848,7 @@ async def async_setup_entry(
         DreameVacuum.async_reset_consumable.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_rename_shortcut",
         {
             vol.Required("shortcut_id"): cv.positive_int,
@@ -844,13 +857,13 @@ async def async_setup_entry(
         DreameVacuum.async_rename_shortcut.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_delete_shortcut",
         {vol.Required("shortcut_id"): cv.positive_int},
         DreameVacuum.async_delete_shortcut.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_set_obstacle_ignore",
         {
             vol.Required("x"): vol.All(vol.Coerce(float)),
@@ -860,7 +873,7 @@ async def async_setup_entry(
         DreameVacuum.async_set_obstacle_ignore.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_set_router_position",
         {
             vol.Required("x"): vol.All(vol.Coerce(int)),
@@ -869,7 +882,7 @@ async def async_setup_entry(
         DreameVacuum.async_set_router_position.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_set_walls",
         {
             vol.Optional("walls"): vol.Any(dict[str, list[int]]),
@@ -898,7 +911,7 @@ async def async_setup_entry(
         DreameVacuum.async_set_walls.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_set_property",
         {
             vol.Required("key"): cv.string,
@@ -908,19 +921,11 @@ async def async_setup_entry(
         DreameVacuum.async_set_property.__name__,
     )
 
-    platform.async_register_entity_service(
+    register_entity_service(
         "vacuum_call_action",
         {vol.Required("key"): cv.string, vol.Optional("value"): cv.string},
         DreameVacuum.async_call_action.__name__,
     )
-
-    activity_class = None
-    ## For backwards compatibility
-    try:
-        module = await async_import_module(hass, f"homeassistant.components.vacuum")
-        activity_class = module.VacuumActivity
-    except:
-        pass
 
     async_add_entities([DreameVacuum(coordinator, activity_class)])
 
@@ -1631,3 +1636,35 @@ class DreameVacuum(DreameVacuumEntity, StateVacuumEntity):
         """Set walls and doors"""
         if (walls is not None and walls != "") or (doors is not None and doors != ""):
             await self._try_command("Unable to call set_walls: %s", self.device.set_walls, walls, doors, map_id)
+
+
+class LocalBridgeVacuum(LocalBridgeEntity, StateVacuumEntity):
+    """Represent a vacuum using only the state reported by the bridge."""
+
+    _attr_name = None
+    _attr_supported_features = VacuumEntityFeature(0)
+
+    def __init__(self, coordinator: LocalBridgeCoordinator, activity_class) -> None:
+        super().__init__(coordinator, "vacuum")
+        self._activity_class = activity_class
+        if activity_class is None:
+            self._attr_state = self._reported_activity()
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        if self._activity_class is None:
+            self._attr_state = self._reported_activity()
+        super()._handle_coordinator_update()
+
+    @property
+    def activity(self):
+        activity = self._reported_activity()
+        if self._activity_class is not None and activity is not None:
+            return self._activity_class(activity)
+        return activity
+
+    def _reported_activity(self) -> str | None:
+        state = self.coordinator.device.status.state
+        if state == DreameVacuumState.UNKNOWN:
+            return None
+        return STATE_CODE_TO_STATE.get(state)

@@ -16,6 +16,7 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN
+from .local_bridge import CONF_BRIDGE_FINGERPRINT, CONF_BRIDGE_TOKEN, CONF_BRIDGE_URL, is_local_bridge
 from .dreame import (
     DreameVacuumAutoSwitchProperty,
     DreameVacuumProperty,
@@ -44,6 +45,9 @@ EXCLUDED_KEYS = [
     "password",
     "token",
     "username",
+    CONF_BRIDGE_FINGERPRINT,
+    CONF_BRIDGE_TOKEN,
+    CONF_BRIDGE_URL,
 ]
 
 EXCLUDED_MAP_KEYS = ["path", "small_path"]
@@ -331,6 +335,12 @@ def _section(builder: Any, *args: Any) -> Any:
 async def _async_diagnostics(hass: HomeAssistant, entry: ConfigEntry, device_id: str | None = None) -> dict[str, Any]:
     coordinator = (hass.data.get(DOMAIN) or {}).get(entry.entry_id)
     device = _get(coordinator, "device")
+    if is_local_bridge(entry.data):
+        return {
+            "entry": _section(_entry_details, entry),
+            "available": bool(device and device.available),
+            "properties": _section(_properties, device),
+        }
     try:
         map_data = await hass.async_add_executor_job(_map_payloads, device)
     except Exception as ex:

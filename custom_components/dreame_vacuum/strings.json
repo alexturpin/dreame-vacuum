@@ -3,7 +3,8 @@
     "abort": {
       "already_configured": "Device is already configured",
       "cannot_connect": "Failed to connect.",
-      "reauth_successful": "Reauthentication is successful"
+      "reauth_successful": "Reauthentication is successful",
+      "reconfigure_unavailable": "Reconfiguration is available for Local MQTT Bridge entries."
     },
     "error": {
       "cannot_connect": "Failed to connect.",
@@ -17,7 +18,9 @@
       "2fa_send_failed": "Failed to send verification code. Please try again.",
       "2fa_limit_reached": "Daily limit for sending verification codes has been reached. Please try again tomorrow.",
       "2fa_cooldown_active": "Too many consecutive requests. Please wait a few minutes before trying again.",
-      "invalid_key": "Invalid key."
+      "invalid_key": "Invalid key.",
+      "invalid_bridge_settings": "Enter a name, a valid local bridge URL and bearer token, and an optional SHA-256 certificate fingerprint.",
+      "cannot_connect_bridge": "Could not authenticate with the local bridge or validate its state response."
     },
     "step": {
       "user": {
@@ -25,6 +28,16 @@
           "configuration_type": "Configuration Type"
         },
         "description": "Select the account type matching the app you use to manage your device."
+      },
+      "local_bridge": {
+        "title": "Local MQTT Bridge",
+        "description": "Enter the bridge origin and bearer token. Use HTTPS on a private IP address. An optional SHA-256 certificate fingerprint can authenticate a privately issued certificate.",
+        "data": {
+          "name": "Name",
+          "bridge_url": "Bridge URL",
+          "bridge_token": "Bridge bearer token",
+          "bridge_fingerprint": "SHA-256 certificate fingerprint"
+        }
       },
       "local": {
         "data": {
@@ -108,6 +121,9 @@
     }
   },
   "options": {
+    "abort": {
+      "local_bridge_reconfigure": "Use Reconfigure on the integration entry to change the bridge settings."
+    },
     "step": {
       "init": {
         "data": {
@@ -194,7 +210,8 @@
         "mi": "Xiaomi Home",
         "mova": "MOVAhome",
         "trouver": "TROUVER",
-        "local": "Local Connection"
+        "local": "Local Connection",
+        "local_bridge": "Local MQTT Bridge"
       }
     },
     "country": {
@@ -2657,6 +2674,16 @@
     }
   },
   "services": {
+    "read_local_battery": {
+      "name": "Read battery via local bridge",
+      "description": "Request one battery reading from the active local bridge session.",
+      "fields": {
+        "config_entry_id": {
+          "name": "Local MQTT Bridge entry",
+          "description": "The ID of the loaded Local MQTT Bridge configuration entry."
+        }
+      }
+    },
     "vacuum_clean_segment": {
       "name": "Clean Segment",
       "description": "Start the cleaning operation in the selected rooms.",

@@ -32,6 +32,12 @@ logging.getLogger("homeassistant.util.logging").addFilter(
 )
 
 from .coordinator import DreameVacuumDataUpdateCoordinator
+from .local_bridge import (
+    SERVICE_READ_LOCAL_BATTERY,
+    LocalBridgeCoordinator,
+    async_register_local_read,
+    is_local_bridge,
+)
 
 PLATFORMS = (
     Platform.VACUUM,
@@ -46,18 +52,36 @@ PLATFORMS = (
 )
 
 
+LOCAL_BRIDGE_PLATFORMS = (Platform.VACUUM, Platform.SENSOR)
+
+
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the Dreame Vacuum integration."""
-    if frontend is not None and hass.config_entries.async_entries(DOMAIN):
+    if frontend is not None and any(
+        not is_local_bridge(entry.data) for entry in hass.config_entries.async_entries(DOMAIN)
+    ):
         await frontend.setup(hass)
     return True
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Dreame Vacuum from a config entry."""
+
+    if is_local_bridge(entry.data):
+        coordinator = LocalBridgeCoordinator(hass, entry)
+        try:
+            await coordinator.async_config_entry_first_refresh()
+            hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
+            await hass.config_entries.async_forward_entry_setups(entry, LOCAL_BRIDGE_PLATFORMS)
+        except BaseException:
+            await coordinator.async_close()
+            hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
+            raise
+        async_register_local_read(hass)
+        return True
 
     coordinator = DreameVacuumDataUpdateCoordinator(hass, entry=entry)
 
@@ -75,6 +99,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload Dreame Vacuum config entry."""
+    if is_local_bridge(entry.data):
+        if not await hass.config_entries.async_unload_platforms(entry, LOCAL_BRIDGE_PLATFORMS):
+            return False
+        coordinators = hass.data[DOMAIN]
+        coordinator = coordinators.pop(entry.entry_id)
+        if not any(isinstance(item, LocalBridgeCoordinator) for item in coordinators.values()):
+            hass.services.async_remove(DOMAIN, SERVICE_READ_LOCAL_BATTERY)
+        await coordinator.async_close()
+        return True
+
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         coordinator: DreameVacuumDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
         if coordinator._unsub_dispatcher:
@@ -93,7 +127,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Handle removal of a Dreame Vacuum config entry."""
-    if frontend is not None:
+    if frontend is not None and not is_local_bridge(entry.data):
         await frontend.remove(hass, entry)
 
 

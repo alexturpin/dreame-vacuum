@@ -36,6 +36,7 @@ from .dreame import (
     DreameVacuumStreamStatus,
 )
 from .coordinator import DreameVacuumDataUpdateCoordinator
+from .local_bridge import LocalBridgeCoordinator, LocalBridgeEntity, is_local_bridge
 from .entity import DreameVacuumEntity, DreameVacuumEntityDescription, remove_entities
 
 STREAM_STATUS_TO_ICON = {
@@ -669,7 +670,10 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up Dreame Vacuum sensor based on a config entry."""
-    coordinator: DreameVacuumDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    if is_local_bridge(entry.data):
+        async_add_entities([LocalBridgeBattery(coordinator)])
+        return
 
     remove_entities(hass, entry, coordinator, "sensor", SENSORS)
     async_add_entities(
@@ -697,3 +701,23 @@ class DreameVacuumSensorEntity(DreameVacuumEntity, SensorEntity):
                 description.value_fn = lambda value, entity: getattr(entity.device.status, prop)
         super().__init__(coordinator, description)
         self._generate_entity_id(ENTITY_ID_FORMAT)
+
+
+class LocalBridgeBattery(LocalBridgeEntity, SensorEntity):
+    """Report the latest battery percentage from the active bridge epoch."""
+
+    _attr_device_class = SensorDeviceClass.BATTERY
+    _attr_native_unit_of_measurement = UNIT_PERCENT
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_translation_key = "battery_level"
+
+    def __init__(self, coordinator: LocalBridgeCoordinator) -> None:
+        super().__init__(coordinator, "battery_level")
+
+    @property
+    def native_value(self) -> int | None:
+        return self.coordinator.device.status.battery_level
+
+    @property
+    def available(self) -> bool:
+        return super().available and self.native_value is not None
