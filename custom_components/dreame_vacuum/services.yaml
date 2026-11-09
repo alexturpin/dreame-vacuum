@@ -6,6 +6,24 @@ read_local_battery:
         config_entry:
           integration: dreame_vacuum
 
+read_local_property:
+  fields:
+    config_entry_id:
+      required: true
+      selector:
+        config_entry:
+          integration: dreame_vacuum
+    property:
+      required: true
+      selector:
+        select:
+          options:
+            - state
+            - status
+            - charging_status
+            - task_status
+            - error
+
 vacuum_clean_segment:
   target:
     entity:

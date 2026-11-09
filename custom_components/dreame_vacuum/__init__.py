@@ -34,6 +34,7 @@ logging.getLogger("homeassistant.util.logging").addFilter(
 from .coordinator import DreameVacuumDataUpdateCoordinator
 from .local_bridge import (
     SERVICE_READ_LOCAL_BATTERY,
+    SERVICE_READ_LOCAL_PROPERTY,
     LocalBridgeCoordinator,
     async_register_local_read,
     is_local_bridge,
@@ -106,6 +107,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         coordinator = coordinators.pop(entry.entry_id)
         if not any(isinstance(item, LocalBridgeCoordinator) for item in coordinators.values()):
             hass.services.async_remove(DOMAIN, SERVICE_READ_LOCAL_BATTERY)
+            hass.services.async_remove(DOMAIN, SERVICE_READ_LOCAL_PROPERTY)
         await coordinator.async_close()
         return True
 

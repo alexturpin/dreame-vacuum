@@ -10,6 +10,7 @@ import socket
 from unittest.mock import patch
 
 from aiohttp import web
+from probatio import Invalid
 import pytest
 import pytest_socket
 
@@ -34,7 +35,9 @@ from custom_components.dreame_vacuum.local_bridge import (
     CONF_BRIDGE_TOKEN,
     CONF_BRIDGE_URL,
     CONF_ENTRY_ID,
+    CONF_PROPERTY,
     SERVICE_READ_LOCAL_BATTERY,
+    SERVICE_READ_LOCAL_PROPERTY,
     LocalBridgeError,
     validate_bridge_url,
 )
@@ -48,8 +51,8 @@ _BATTERY = "sensor.bridge_test_battery_level"
 pytestmark = [pytest.mark.usefixtures("enable_custom_integrations"), pytest.mark.asyncio]
 
 
-def _property(did, siid, value):
-    return {"did": did, "siid": siid, "piid": 1, "code": 0, "value": value}
+def _property(did, siid, value, *, piid=1):
+    return {"did": did, "siid": siid, "piid": piid, "code": 0, "value": value}
 
 
 def _state(*properties, epoch=_EPOCH, sequence=0):
@@ -76,6 +79,7 @@ class FakeBridge:
     raw_state: str | None = None
     read_reply: dict = field(default_factory=dict)
     read_error: str | None = None
+    read_status: int = 200
     read_started: Event = field(default_factory=Event)
     read_release: Event | None = None
     read_state: dict | None = None
@@ -107,7 +111,7 @@ class FakeBridge:
         if self.read_error is not None:
             del reply["result"]
             reply["error"] = self.read_error
-        return web.json_response(reply | self.read_reply)
+        return web.json_response(reply | self.read_reply, status=self.read_status)
 
 
 @pytest.fixture
@@ -171,6 +175,17 @@ async def _load_entry(hass, bridge):
 async def _refresh(hass, coordinator):
     await coordinator.async_refresh()
     await hass.async_block_till_done()
+
+
+async def _read_trial(hass, entry, user, property_name, *, response=True):
+    return await hass.services.async_call(
+        DOMAIN,
+        SERVICE_READ_LOCAL_PROPERTY,
+        {CONF_ENTRY_ID: entry.entry_id, CONF_PROPERTY: property_name},
+        blocking=True,
+        return_response=response,
+        context=Context(user_id=user.id),
+    )
 
 
 async def test_loopback_fixture_blocks_external_sockets_and_ignores_env_proxy(hass, bridge, monkeypatch):
@@ -258,6 +273,7 @@ async def test_configure_and_passive_lifecycle(hass, bridge):
     await hass.async_block_till_done()
     assert entry.entry_id not in hass.data[DOMAIN]
     assert not hass.services.has_service(DOMAIN, SERVICE_READ_LOCAL_BATTERY)
+    assert not hass.services.has_service(DOMAIN, SERVICE_READ_LOCAL_PROPERTY)
     assert not coordinator.device.data
     for entity_id in (_VACUUM, _BATTERY):
         state = hass.states.get(entity_id)
@@ -377,6 +393,8 @@ async def test_read_is_never_queued_and_cannot_resume_after_unload(hass, bridge,
         assert len(bridge.posts) == 1
         with pytest.raises(LocalBridgeError, match="is busy"):
             await wait_for(read(), timeout=2)
+        with pytest.raises(LocalBridgeError, match="is busy"):
+            await wait_for(_read_trial(hass, entry, hass_admin_user, "state"), timeout=2)
         assert await hass.config_entries.async_unload(entry.entry_id)
         assert coordinator.device.disconnected
         gets_at_unload = bridge.gets
@@ -398,18 +416,217 @@ async def test_local_read_service_tracks_loaded_entries(hass, bridge_factory):
     assert duplicate["type"] is FlowResultType.ABORT
     assert duplicate["reason"] == "already_configured"
     assert await hass.config_entries.async_unload(first.entry_id)
-    assert hass.services.has_service(DOMAIN, SERVICE_READ_LOCAL_BATTERY)
-    with pytest.raises(LocalBridgeError, match="Select a loaded"):
-        await hass.services.async_call(
-            DOMAIN,
-            SERVICE_READ_LOCAL_BATTERY,
-            {CONF_ENTRY_ID: first.entry_id},
-            blocking=True,
-            return_response=True,
-        )
+    services = {
+        SERVICE_READ_LOCAL_BATTERY: {},
+        SERVICE_READ_LOCAL_PROPERTY: {CONF_PROPERTY: "state"},
+    }
+    for service, data in services.items():
+        assert hass.services.has_service(DOMAIN, service)
+        with pytest.raises(LocalBridgeError, match="Select a loaded"):
+            await hass.services.async_call(
+                DOMAIN,
+                service,
+                {CONF_ENTRY_ID: first.entry_id} | data,
+                blocking=True,
+                return_response=True,
+            )
     assert await hass.config_entries.async_unload(second.entry_id)
-    assert not hass.services.has_service(DOMAIN, SERVICE_READ_LOCAL_BATTERY)
+    assert all(not hass.services.has_service(DOMAIN, service) for service in services)
     assert not first_bridge.posts and not second_bridge.posts
+
+
+async def test_property_action_authorization_schema_and_controls(hass, bridge, hass_admin_user, hass_read_only_user):
+    bridge.state = _state(_property("0", 2, 2), sequence=1)
+    entry, _ = await _load_entry(hass, bridge)
+    assert hass.services.has_service(DOMAIN, SERVICE_READ_LOCAL_PROPERTY)
+    assert hass.states.get(_VACUUM).attributes["supported_features"] == 0
+
+    with pytest.raises(Unauthorized):
+        await _read_trial(hass, entry, hass_read_only_user, "state")
+    with pytest.raises(HomeAssistantError):
+        await _read_trial(hass, entry, hass_admin_user, "state", response=False)
+
+    for invalid in (
+        {},
+        {CONF_PROPERTY: "battery_level"},
+        {CONF_PROPERTY: ["state", "status"]},
+        {CONF_PROPERTY: {"did": "0", "siid": 2, "piid": 1}},
+        {CONF_PROPERTY: "STATE"},
+        {CONF_PROPERTY: "state", "continuation": "a" * 32},
+    ):
+        with pytest.raises(Invalid):
+            await hass.services.async_call(
+                DOMAIN,
+                SERVICE_READ_LOCAL_PROPERTY,
+                {CONF_ENTRY_ID: entry.entry_id} | invalid,
+                blocking=True,
+                return_response=True,
+                context=Context(user_id=hass_admin_user.id),
+            )
+    assert not bridge.posts
+
+
+async def test_five_explicit_reads_return_raw_values_without_updating_cache(hass, bridge, hass_admin_user):
+    bridge.state = _state(_property("0", 2, 2), _property("2", 3, 45), _property("5", 4, 1), sequence=1)
+    entry, coordinator = await _load_entry(hass, bridge)
+    assert not bridge.posts
+    continuation = None
+    for step, (name, did, siid, piid, value) in enumerate(
+        (
+            ("state", "0", 2, 1, (1 << 31) - 1),
+            ("status", "5", 4, 1, -(1 << 31)),
+            ("charging_status", "3", 3, 2, 0),
+            ("task_status", "11", 4, 7, 99),
+            ("error", "1", 2, 2, -7),
+        ),
+        start=1,
+    ):
+        next_receipt = str(step) * 32 if step < 5 else None
+        bridge.read_reply = {
+            "result": [_property(did, siid, value, piid=piid)],
+            "continuation": next_receipt,
+        }
+        identity = {"did": did, "siid": siid, "piid": piid}
+        assert await _read_trial(hass, entry, hass_admin_user, name) == {
+            "property": name, **identity, "value": value
+        }
+        assert len(bridge.posts) == step
+        request = bridge.posts[-1]
+        assert len(request["request_id"]) == 32
+        assert request == {
+            "version": 1,
+            "request_id": request["request_id"],
+            "epoch": _EPOCH,
+            "method": "get_properties",
+            "params": [identity],
+            "timeout": 5,
+            "continuation": continuation,
+        }
+        continuation = next_receipt
+    assert len({request["request_id"] for request in bridge.posts}) == 5
+    with pytest.raises(LocalBridgeError, match="trial ended"):
+        await _read_trial(hass, entry, hass_admin_user, "state")
+    await _refresh(hass, coordinator)
+    assert len(bridge.posts) == 5
+    assert hass.states.get(_VACUUM).state == "idle"
+    assert hass.states.get(_BATTERY).state == "45"
+    diagnostics = await async_get_config_entry_diagnostics(hass, entry)
+    assert diagnostics["properties"] == {"BATTERY_LEVEL": 45, "STATE": 2, "STATUS": 1}
+    assert "continuation" not in json.dumps(diagnostics)
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        {"request_id": "wrong"},
+        {"epoch": _NEW_EPOCH},
+        {"result": [_property("5", 4, 1)]},  # Valid but different property.
+        {"result": [_property("0", 2, 1, piid=2)]},
+        {"result": [_property(0, 2, 1)]},
+        {"result": [_property("0", 2, True)]},
+        {"result": [_property("0", 2, 1 << 31)]},
+        {"result": [_property("0", 2, -(1 << 31) - 1)]},
+        {"result": [_property("0", 2, 1), _property("0", 2, 2)]},
+        {"result": [_property("0", 2, 1) | {"code": 1}]},
+        {"continuation": "Z" * 32},
+        {"continuation": None},
+    ],
+)
+async def test_reject_uncorrelated_or_malformed_property_reply(hass, bridge, hass_admin_user, reply):
+    bridge.state = _state(_property("0", 2, 2), sequence=1)
+    entry, _ = await _load_entry(hass, bridge)
+    bridge.read_reply = {
+        "result": [_property("0", 2, 1)],
+        "continuation": "1" * 32,
+    } | reply
+    with pytest.raises(LocalBridgeError):
+        await _read_trial(hass, entry, hass_admin_user, "state")
+    with pytest.raises(LocalBridgeError, match="trial ended"):
+        await _read_trial(hass, entry, hass_admin_user, "status")
+    assert len(bridge.posts) == 1
+
+
+@pytest.mark.parametrize("read_status,read_error", [(503, None), (200, "property_error")])
+async def test_failed_middle_read_seals_epoch(hass, bridge, hass_admin_user, read_status, read_error):
+    bridge.state = _state(_property("0", 2, 2), sequence=1)
+    entry, _ = await _load_entry(hass, bridge)
+    bridge.read_reply = {"result": [_property("0", 2, 1)], "continuation": "1" * 32}
+    await _read_trial(hass, entry, hass_admin_user, "state")
+
+    bridge.read_status, bridge.read_error, bridge.read_reply = read_status, read_error, {}
+    with pytest.raises(LocalBridgeError):
+        await _read_trial(hass, entry, hass_admin_user, "status")
+    assert bridge.posts[-1]["continuation"] == "1" * 32
+    with pytest.raises(LocalBridgeError, match="trial ended"):
+        await _read_trial(hass, entry, hass_admin_user, "charging_status")
+    assert len(bridge.posts) == 2
+
+    bridge.state = _state(_property("0", 2, 2), epoch=_NEW_EPOCH, sequence=1)
+    bridge.read_status, bridge.read_error = 200, None
+    bridge.read_reply = {"result": [_property("0", 2, 1)], "continuation": "2" * 32}
+    await _read_trial(hass, entry, hass_admin_user, "state")
+    assert bridge.posts[-1]["epoch"] == _NEW_EPOCH
+    assert bridge.posts[-1]["continuation"] is None
+
+
+async def test_property_receipt_is_discarded_if_postflight_changes_epoch(hass, bridge, hass_admin_user):
+    bridge.state = _state(_property("0", 2, 2), sequence=1)
+    entry, _ = await _load_entry(hass, bridge)
+    bridge.read_reply = {"result": [_property("0", 2, 1)], "continuation": "1" * 32}
+    bridge.read_state = _state(_property("0", 2, 2), epoch=_NEW_EPOCH, sequence=1)
+    with pytest.raises(LocalBridgeError, match="session changed"):
+        await _read_trial(hass, entry, hass_admin_user, "state")
+    await _read_trial(hass, entry, hass_admin_user, "state")
+    assert [request["epoch"] for request in bridge.posts] == [_EPOCH, _NEW_EPOCH]
+    assert [request["continuation"] for request in bridge.posts] == [None, None]
+
+
+async def test_overlapping_property_read_does_not_queue_or_disrupt_trial(hass, bridge, hass_admin_user):
+    bridge.state = _state(_property("0", 2, 2), sequence=1)
+    entry, coordinator = await _load_entry(hass, bridge)
+    bridge.read_reply = {"result": [_property("0", 2, 1)], "continuation": "1" * 32}
+    bridge.read_release = Event()
+    pending = hass.async_create_task(_read_trial(hass, entry, hass_admin_user, "state"))
+    try:
+        await wait_for(bridge.read_started.wait(), timeout=2)
+        with pytest.raises(LocalBridgeError, match="is busy"):
+            await wait_for(_read_trial(hass, entry, hass_admin_user, "status"), timeout=2)
+        gets = bridge.gets
+        await coordinator.async_refresh()
+        assert bridge.gets == gets
+        assert len(bridge.posts) == 1
+    finally:
+        bridge.read_release.set()
+    assert (await pending)["property"] == "state"
+    assert len(bridge.posts) == 1
+
+    bridge.read_reply = {"result": [_property("5", 4, 1)], "continuation": "2" * 32}
+    assert (await _read_trial(hass, entry, hass_admin_user, "status"))["property"] == "status"
+    assert bridge.posts[-1]["continuation"] == "1" * 32
+    assert len(bridge.posts) == 2
+
+
+@pytest.mark.parametrize("disconnect", [False, True])
+async def test_passive_poll_loss_seals_in_progress_trial(hass, bridge, hass_admin_user, disconnect):
+    bridge.state = _state(_property("0", 2, 2), sequence=1)
+    entry, coordinator = await _load_entry(hass, bridge)
+    bridge.read_reply = {"result": [_property("0", 2, 1)], "continuation": "1" * 32}
+    await _read_trial(hass, entry, hass_admin_user, "state")
+
+    if disconnect:
+        bridge.state = _state(epoch=None)
+    else:
+        bridge.status = 503
+    await _refresh(hass, coordinator)
+    assert hass.states.get(_VACUUM).state == STATE_UNAVAILABLE
+
+    bridge.status = 200
+    bridge.state = _state(_property("0", 2, 2), sequence=2)
+    await _refresh(hass, coordinator)
+    assert hass.states.get(_VACUUM).state == "idle"
+    with pytest.raises(LocalBridgeError, match="trial ended"):
+        await _read_trial(hass, entry, hass_admin_user, "status")
+    assert len(bridge.posts) == 1
 
 
 async def test_reconfigure_reloads_and_never_publishes(hass, bridge):

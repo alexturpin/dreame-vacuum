@@ -62,6 +62,22 @@ still active. It returns `battery_level` to the caller. The sensor continues
 to reflect passive telemetry. The bridge may refuse the action when its
 one-shot read authorization is absent or exhausted.
 
+The administrator action `dreame_vacuum.read_local_property` takes a loaded
+local `config_entry_id` and one `property` from the table below. Enable
+response handling and authorize the trial at the bridge before calling it.
+Invoke each action separately in the table's order and stop on the first
+failure. The action returns the property name, `did`, `siid`, `piid`, and
+the raw integer `value`. An unfamiliar code is returned as received. Entities
+and diagnostics continue to reflect passive reports.
+
+| Property | `did` | `siid` | `piid` |
+| --- | --- | --- | --- |
+| `state` | `"0"` | 2 | 1 |
+| `status` | `"5"` | 4 | 1 |
+| `charging_status` | `"3"` | 3 | 2 |
+| `task_status` | `"11"` | 4 | 7 |
+| `error` | `"1"` | 2 | 2 |
+
 ### Bridge contract
 
 Both endpoints require the configured bearer token. The client disables
@@ -79,10 +95,19 @@ redirects and environment proxies.
   (`did: "5"`, `4.1`). Battery is bounded to 0–100.
 - `POST /v1/read` sends `version: 1`, a unique 32-character lowercase hex
   `request_id`, the active `epoch`, `method: "get_properties"`, a five-second
-  `timeout`, and exactly one item in `params` with `did: "2"`, `siid: 3`, and
-  `piid: 1`. A successful reply returns `version`, `request_id`, `epoch`, and a
-  one-item `result` with that battery address. Refusals and transport or
-  protocol failures produce an action error.
+  `timeout`, and exactly one `{did, siid, piid}` in `params`. The battery
+  address is `("2", 3, 1)`. A successful reply returns `version`,
+  `request_id`, `epoch`, and a one-item `result` with the exact requested
+  address, `code: 0`, and an integer `value`. Battery is bounded to 0–100
+  and the five trial properties to signed 32-bit integers.
+- Requests for a trial property also carry `continuation`. It is null for
+  the first request and contains the previous successful reply's receipt
+  thereafter. Each successful trial reply carries the next receipt as 32
+  lowercase hexadecimal characters, or null for the fifth and final reply.
+  The client retains a receipt only after confirming the active epoch again.
+  The battery action uses the original request and reply fields. An error
+  reply carries `version`, `request_id`, `epoch`, and `error`. A refusal or
+  transport or protocol failure ends the trial for that client and epoch.
 
 ### Offline verification
 

@@ -16,12 +16,21 @@ platform setup stop before legacy service registration or device probing.
 When both entry types coexist, legacy custom vacuum services require the
 send-command feature that only legacy vacuum entities advertise.
 
-The explicit battery action uses the bridge client, not the upstream
-`_request_properties` path. The latter constructs the same MIoT address but
-batches and handles results through the legacy update path. The local action
-validates one reply and returns its value without inserting it into the
-passive cache. The robot-owning bridge can separately arm exactly one
-accepted request during a trial.
+The explicit administrator actions use the bridge client's singleton read.
+Upstream `_request_properties` batches results through the legacy update
+path. Each bridge action checks passive readiness, validates a correlated
+reply for the exact address, checks the session again, and returns the raw
+value to the caller. The passive cache is populated by snapshots. A local
+coordinator refuses overlapping reads while it awaits the snapshot or reply.
+
+The battery action retains its separate one-shot bridge authorization. For
+the five-property trial, the bridge authorizes the sequence and returns an
+opaque receipt on each successful intermediate reply. The coordinator keeps
+it in memory after confirming the reply and epoch. The operator invokes
+each subsequent property separately. A read failure or loss of passive
+readiness clears the receipt and seals the trial for the current epoch.
+Reloading the entry loses the receipt. The bridge requires the previous
+receipt to continue a partially completed trial.
 
 For any later expansion, the device protocol-construction seam is the
 assignment to `DreameVacuumDevice._protocol`. The upstream device places

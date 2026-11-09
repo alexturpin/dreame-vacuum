@@ -2684,6 +2684,20 @@
         }
       }
     },
+    "read_local_property": {
+      "name": "Read property via local bridge",
+      "description": "Request one authorized status or error reading from the active local bridge session.",
+      "fields": {
+        "config_entry_id": {
+          "name": "Local MQTT Bridge entry",
+          "description": "The ID of the loaded Local MQTT Bridge configuration entry."
+        },
+        "property": {
+          "name": "Property",
+          "description": "The single status or error property to read."
+        }
+      }
+    },
     "vacuum_clean_segment": {
       "name": "Clean Segment",
       "description": "Start the cleaning operation in the selected rooms.",
