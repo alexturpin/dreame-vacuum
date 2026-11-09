@@ -40,7 +40,7 @@
           "bridge_read_mode": "Read mode"
         },
         "data_description": {
-          "bridge_read_mode": "Use bounded state refresh only with an owner configured for that trial."
+          "bridge_read_mode": "Select the read mode authorized by your bridge owner."
         }
       },
       "local": {
@@ -211,7 +211,8 @@
     "bridge_read_mode": {
       "options": {
         "legacy": "Legacy individual reads",
-        "state_refresh": "Bounded state refresh"
+        "state_refresh": "Bounded state refresh",
+        "state_refresh_run": "Finite state refresh run"
       }
     },
     "configuration_type": {
@@ -810,6 +811,9 @@
       },
       "local_state_refresh": {
         "name": "Local state refresh"
+      },
+      "local_state_refresh_run": {
+        "name": "Local state refresh run"
       },
       "bssid": {
         "name": "BSSID"
@@ -2687,6 +2691,26 @@
     }
   },
   "services": {
+    "start_local_state_refresh_run": {
+      "name": "Start local state refresh run",
+      "description": "Claim one authorized run of up to three five-property cycles.",
+      "fields": {
+        "config_entry_id": {
+          "name": "Local MQTT Bridge entry",
+          "description": "The ID of the loaded bridge entry configured for a finite refresh run."
+        }
+      }
+    },
+    "cancel_local_state_refresh_run": {
+      "name": "Cancel local state refresh run",
+      "description": "Stop a finite refresh run and request revocation of its remaining grant.",
+      "fields": {
+        "config_entry_id": {
+          "name": "Local MQTT Bridge entry",
+          "description": "The ID of the loaded bridge entry configured for a finite refresh run."
+        }
+      }
+    },
     "refresh_local_state": {
       "name": "Refresh local state",
       "description": "Request one authorized five-property refresh from the active local bridge session.",

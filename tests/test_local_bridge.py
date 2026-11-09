@@ -2,25 +2,31 @@
 
 from __future__ import annotations
 
-from asyncio import CancelledError, Event, get_running_loop, sleep, wait_for
+from asyncio import CancelledError, Event, get_running_loop, sleep, timeout, wait_for
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 import json
 import socket
+import ssl
 from unittest.mock import patch
 
 from aiohttp import web
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import NameOID
 from probatio import Invalid
 import pytest
 import pytest_socket
 
 from homeassistant.config_entries import ConfigEntryState, SOURCE_RECONFIGURE, SOURCE_USER
-from homeassistant.const import CONF_NAME, STATE_UNAVAILABLE, STATE_UNKNOWN
+from homeassistant.const import CONF_NAME, EVENT_HOMEASSISTANT_STOP, STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.core import Context
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.exceptions import HomeAssistantError, Unauthorized
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
+from homeassistant.setup import async_setup_component
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import async_fire_time_changed
 
@@ -34,6 +40,7 @@ from custom_components.dreame_vacuum.dreame import (
 )
 from custom_components.dreame_vacuum.local_bridge import (
     ACCOUNT_TYPE_LOCAL_BRIDGE,
+    CONF_BRIDGE_FINGERPRINT,
     CONF_BRIDGE_READ_MODE,
     CONF_BRIDGE_TOKEN,
     CONF_BRIDGE_URL,
@@ -41,9 +48,12 @@ from custom_components.dreame_vacuum.local_bridge import (
     CONF_PROPERTY,
     READ_MODE_LEGACY,
     READ_MODE_STATE_REFRESH,
+    READ_MODE_STATE_REFRESH_RUN,
+    SERVICE_CANCEL_LOCAL_STATE_REFRESH_RUN,
     SERVICE_READ_LOCAL_BATTERY,
     SERVICE_READ_LOCAL_PROPERTY,
     SERVICE_REFRESH_LOCAL_STATE,
+    SERVICE_START_LOCAL_STATE_REFRESH_RUN,
     LocalBridgeError,
     validate_bridge_url,
 )
@@ -54,6 +64,7 @@ _NEW_EPOCH = "b" * 32
 _VACUUM = "vacuum.bridge_test"
 _BATTERY = "sensor.bridge_test_battery_level"
 _REFRESH_SENSOR = "sensor.bridge_test_local_state_refresh"
+_RUN_SENSOR = "sensor.bridge_test_local_state_refresh_run"
 _REFRESH_ADDRESSES = (
     ("0", 2, 1),
     ("5", 4, 1),
@@ -1016,3 +1027,556 @@ async def test_reject_invalid_snapshots(hass, bridge, bad_state):
 async def test_reject_unsafe_origins(value):
     with pytest.raises(ValueError):
         validate_bridge_url(value)
+
+
+@dataclass
+class FakeRefreshRunBridge(FakeBridge):
+    """Pinned TLS fixture with independently controlled claim and read responses."""
+
+    pin: str = ""
+    remaining_ms: int = 599_000
+    claims: list[dict] = field(default_factory=list, repr=False)
+    aborts: list[dict] = field(default_factory=list, repr=False)
+    posts: list[dict] = field(default_factory=list, repr=False)
+    claim_started: Event = field(default_factory=Event)
+    claim_release: Event | None = None
+    abort_status: int = 200
+    mutate_response: object = None
+    last_read_status: int = 200
+    raw_claim: str | None = None
+
+    async def post_run(self, request):
+        if request.headers.get("Authorization") != f"Bearer {self.token}":
+            raise web.HTTPUnauthorized()
+        payload = await request.json()
+        action = request.match_info["action"]
+        reply = {key: payload[key] for key in ("version", "request_id", "epoch", "run_id")}
+        status = 200
+        if action == "claim":
+            self.claims.append(payload)
+            self.claim_started.set()
+            if self.claim_release is not None:
+                await self.claim_release.wait()
+            reply |= {
+                "mode": READ_MODE_STATE_REFRESH_RUN,
+                "max_cycles": 3,
+                "max_reads": 15,
+                "min_cycle_interval_seconds": 120,
+                "remaining_grant_ms": self.remaining_ms,
+                "cycle": 1,
+                "cycle_capability": f"{1:032x}",
+            }
+        elif action == "abort":
+            self.aborts.append(payload)
+            status = self.abort_status
+            reply["terminal"] = True
+        else:
+            self.posts.append(payload)
+            self.request_times.append(get_running_loop().time())
+            index = len(self.posts)
+            if index == self.hold_read_at:
+                self.read_started.set()
+                if self.read_release is not None:
+                    await self.read_release.wait()
+            cycle, property_index = divmod(index - 1, 5)
+            did, siid, piid = _REFRESH_ADDRESSES[property_index]
+            value = (2, -(1 << 31), 2, 0, (1 << 31) - 1)[property_index]
+            last = property_index == 4
+            reply |= {
+                "cycle": cycle + 1,
+                "result": [_property(did, siid, value, piid=piid)],
+                "continuation": None if last else f"{100 + index:032x}",
+                "next_cycle_capability": f"{cycle + 2:032x}" if last and cycle < 2 else None,
+            }
+            if last:
+                status = self.last_read_status
+                if self.read_state is not None:
+                    self.state = self.read_state
+        if self.mutate_response is not None:
+            reply = self.mutate_response(action, payload, reply)
+        if action == "claim" and self.raw_claim is not None:
+            return web.Response(
+                text=json.dumps(reply)[:-1] + self.raw_claim, content_type="application/json"
+            )
+        return web.json_response(reply, status=status)
+
+
+@pytest.fixture
+async def run_bridge(aiohttp_server, socket_enabled, tmp_path):
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "loopback bridge fixture")])
+    now = datetime.now(UTC)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(days=1))
+        .not_valid_after(now + timedelta(days=1))
+        .sign(key, hashes.SHA256())
+    )
+    cert_path, key_path = tmp_path / "test.crt", tmp_path / "test.key"
+    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(key.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
+    ))
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert_path, key_path)
+    bridge = FakeRefreshRunBridge(pin=cert.fingerprint(hashes.SHA256()).hex())
+    _prepare_refresh(bridge)
+    app = web.Application()
+    app.router.add_get("/v1/state", bridge.get_state)
+    app.router.add_post("/v1/read", bridge.post_read)
+    app.router.add_post("/v2/refresh/{action:claim|read|abort}", bridge.post_run)
+    server = await aiohttp_server(app, ssl=context)
+    bridge.url = str(server.make_url("/").origin())
+    return bridge
+
+
+async def _load_run_entry(hass, bridge):
+    return await _load_entry(hass, bridge, **{
+        CONF_BRIDGE_READ_MODE: READ_MODE_STATE_REFRESH_RUN,
+        CONF_BRIDGE_FINGERPRINT: bridge.pin,
+    })
+
+
+async def _run_action(hass, entry, context, service=SERVICE_START_LOCAL_STATE_REFRESH_RUN, **fields):
+    return await hass.services.async_call(
+        DOMAIN, service, {CONF_ENTRY_ID: entry.entry_id} | fields,
+        blocking=True, return_response=True, context=context,
+    )
+
+
+async def _wait_for_run_state(hass, expected):
+    try:
+        async with timeout(2):
+            while hass.states.get(_RUN_SENSOR).state != expected:
+                await sleep(0.002)
+    except TimeoutError:
+        pytest.fail(f"Expected {expected}; last progress {hass.states.get(_RUN_SENSOR)}")
+    return hass.states.get(_RUN_SENSOR)
+
+
+@pytest.fixture
+def advance_loop(hass, monkeypatch):
+    """Advance the actual asyncio timer queue without accelerating wall time."""
+    loop = hass.loop
+    real_time = loop.time
+    offset = 0
+    monkeypatch.setattr(loop, "time", lambda: real_time() + offset)
+    monkeypatch.setattr(loop, "slow_callback_duration", float("inf"))
+
+    async def advance(seconds, *, smooth=False):
+        nonlocal offset
+        if smooth:
+            # Let each real HA poll start near its due time instead of
+            # bunching timer handles at arbitrary jumps.
+            while seconds > 0.25:
+                offset += 0.25
+                seconds -= 0.25
+                await sleep(0.002)
+        offset += seconds
+        await sleep(0.01)
+
+    return advance
+
+
+async def test_finite_run_three_cycles_keep_passive_poll_phase_and_snapshot_ttl(
+    hass, run_bridge, hass_admin_user, advance_loop
+):
+    entry, coordinator = await _load_run_entry(hass, run_bridge)
+    assert hass.states.get(_RUN_SENSOR).state == "inactive"
+    assert not run_bridge.posts and not run_bridge.claims
+    context = Context(user_id=hass_admin_user.id)
+    accepted = await _run_action(hass, entry, context)
+    assert accepted["state"] == "starting" and accepted["completed_cycles"] == 0
+    assert accepted["max_cycles"] == 3 and accepted["expires_at"]
+    first_wait = await _wait_for_run_state(hass, "waiting")
+    assert first_wait.attributes["completed_cycles"] == 1
+    assert first_wait.attributes["next_due_at"]
+    assert hass.states.get(_REFRESH_SENSOR).state == "idle"
+    assert hass.states.get(_VACUUM).state == "paused"
+    assert hass.states.get(_BATTERY).state == "42"
+    initial_snapshot = coordinator.refresh_snapshot
+    properties = initial_snapshot["properties"]
+    assert (properties["status"]["value"], properties["status"]["label"]) == (-(1 << 31), None)
+    assert (properties["error"]["value"], properties["error"]["label"]) == ((1 << 31) - 1, None)
+    assert properties["task_status"]["value"] == 0
+
+    for cycle in (1, 2):
+        gets = run_bridge.gets
+        for _ in range(6):
+            await advance_loop(10.1, smooth=True)
+        _assert_no_refresh(hass)
+        progress = hass.states.get(_RUN_SENSOR)
+        assert progress.state == "waiting", progress
+        assert len(run_bridge.posts) == cycle * 5
+        assert run_bridge.gets - gets >= 5
+        for _ in range(6):
+            await advance_loop(10.1, smooth=True)
+        assert len(run_bridge.posts) == cycle * 5
+        await advance_loop(4.1, smooth=True)
+        expected = "waiting" if cycle == 1 else "completed"
+        state = await _wait_for_run_state(hass, expected)
+        assert state.attributes["completed_cycles"] == cycle + 1
+        assert hass.states.get(_REFRESH_SENSOR).state == "idle"
+        assert run_bridge.request_times[cycle * 5] - run_bridge.request_times[cycle * 5 - 1] >= 125
+        coordinator._expire_refresh_snapshot(initial_snapshot)
+        assert hass.states.get(_REFRESH_SENSOR).state == "idle"
+
+    for _ in range(13):
+        await advance_loop(10.1)
+    _assert_no_refresh(hass)
+    assert hass.states.get(_RUN_SENSOR).state == "completed"
+    assert len(run_bridge.claims) == 1 and len(run_bridge.posts) == 15
+    assert not run_bridge.aborts
+    assert len({item["request_id"] for item in run_bridge.claims + run_bridge.posts}) == 16
+    for index, payload in enumerate(run_bridge.posts):
+        cycle, prop = divmod(index, 5)
+        did, siid, piid = _REFRESH_ADDRESSES[prop]
+        assert payload["params"] == [{"did": did, "siid": siid, "piid": piid}]
+        assert payload["version"] == 2 and payload["method"] == "get_properties"
+        assert payload["run_id"] == run_bridge.claims[0]["run_id"]
+        assert payload["epoch"] == _EPOCH and payload["cycle"] == cycle + 1
+        assert payload["timeout"] == 5
+        assert payload["cycle_capability"] == (f"{cycle + 1:032x}" if prop == 0 else None)
+        assert payload["continuation"] == (f"{100 + index:032x}" if prop > 0 else None)
+    with pytest.raises(HomeAssistantError, match="already been used"):
+        await _run_action(hass, entry, context)
+
+
+@pytest.mark.parametrize("transport", ["rest", "websocket"])
+async def test_finite_run_accepts_pinned_ha_direct_api_and_ui_calls(
+    hass, run_bridge, hass_client, hass_ws_client, transport
+):
+    entry, _ = await _load_run_entry(hass, run_bridge)
+    assert hass.states.get(_RUN_SENSOR).state == "inactive"
+    data = {CONF_ENTRY_ID: entry.entry_id}
+    if transport == "rest":
+        assert await async_setup_component(hass, "api", {})
+        client = await hass_client()
+        response = await client.post(f"/api/services/{DOMAIN}/{SERVICE_START_LOCAL_STATE_REFRESH_RUN}", json=data)
+        assert response.status == 200, await response.text()
+    else:
+        client = await hass_ws_client()
+        await client.send_json({
+            "id": 1, "type": "call_service", "domain": DOMAIN,
+            "service": SERVICE_START_LOCAL_STATE_REFRESH_RUN, "service_data": data,
+            "return_response": True,
+        })
+        result = await client.receive_json()
+        assert result["success"], result
+        assert result["result"]["response"]["state"] == "starting"
+    await _wait_for_run_state(hass, "waiting")
+    assert len(run_bridge.claims) == 1 and len(run_bridge.posts) == 5
+
+
+async def test_finite_run_requires_direct_admin_exact_schema_and_distinct_mode(
+    hass, run_bridge, hass_admin_user, hass_read_only_user
+):
+    entry, _ = await _load_run_entry(hass, run_bridge)
+    admin_context = Context(user_id=hass_admin_user.id)
+    for service in (SERVICE_START_LOCAL_STATE_REFRESH_RUN, SERVICE_CANCEL_LOCAL_STATE_REFRESH_RUN):
+        with pytest.raises(HomeAssistantError, match="direct authenticated administrator"):
+            await _run_action(hass, entry, Context(), service)
+        with pytest.raises(HomeAssistantError, match="direct authenticated administrator"):
+            await _run_action(hass, entry, Context(user_id=hass_admin_user.id, parent_id=Context().id), service)
+        with pytest.raises(Unauthorized):
+            await _run_action(hass, entry, Context(user_id=hass_read_only_user.id), service)
+        with pytest.raises(Invalid):
+            await _run_action(hass, entry, admin_context, service, cycle=2)
+    with pytest.raises(HomeAssistantError, match="requires the state refresh bridge mode"):
+        await _refresh_trial(hass, entry, hass_admin_user)
+    with pytest.raises(HomeAssistantError, match="require the legacy local bridge mode"):
+        await _read_trial(hass, entry, hass_admin_user, "state")
+    assert (await _run_action(hass, entry, admin_context, SERVICE_CANCEL_LOCAL_STATE_REFRESH_RUN))["state"] == "inactive"
+    assert not run_bridge.claims and not run_bridge.posts and not run_bridge.aborts
+
+
+@pytest.mark.parametrize("pin", ["", "00" * 32])
+async def test_finite_run_requires_the_pinned_https_certificate(hass, run_bridge, pin):
+    result = await _configure(hass, run_bridge, await _start_flow(hass), **{
+        CONF_BRIDGE_READ_MODE: READ_MODE_STATE_REFRESH_RUN,
+        CONF_BRIDGE_FINGERPRINT: pin,
+    })
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"]["base"] == ("cannot_connect_bridge" if pin else "invalid_bridge_settings")
+    assert not run_bridge.claims
+
+
+@pytest.mark.parametrize("interrupt", ["cancel", "start_task_cancelled", "failed_unload", "core_stop"])
+async def test_finite_run_interrupts_pending_claim_and_never_adopts_late_capability(
+    hass, run_bridge, hass_admin_user, interrupt
+):
+    entry, coordinator = await _load_run_entry(hass, run_bridge)
+    run_bridge.claim_release = Event()
+    run_bridge.abort_status = 503
+    context = Context(user_id=hass_admin_user.id)
+    start_task = hass.async_create_task(_run_action(hass, entry, context))
+    try:
+        await wait_for(run_bridge.claim_started.wait(), 2)
+        with pytest.raises(HomeAssistantError, match="busy"):
+            await _run_action(hass, entry, context)
+        assert hass.states.get(_RUN_SENSOR).state == "starting"
+        assert not run_bridge.posts
+        if interrupt == "cancel":
+            stopped = await _run_action(hass, entry, context, SERVICE_CANCEL_LOCAL_STATE_REFRESH_RUN)
+            assert stopped["state"] == "cancelled" and stopped["reason"] == "requested"
+            await _run_action(hass, entry, context, SERVICE_CANCEL_LOCAL_STATE_REFRESH_RUN)
+        elif interrupt == "start_task_cancelled":
+            start_task.cancel()
+        elif interrupt == "failed_unload":
+            with patch.object(hass.config_entries, "async_unload_platforms", return_value=False):
+                assert not await hass.config_entries.async_unload(entry.entry_id)
+        else:
+            hass.bus.async_fire(EVENT_HOMEASSISTANT_STOP)
+        with pytest.raises(CancelledError):
+            await wait_for(start_task, 2)
+        await hass.async_block_till_done()
+        assert coordinator._run is None
+        assert hass.states.get(_RUN_SENSOR).state == "cancelled"
+        _assert_no_refresh(hass)
+        assert not run_bridge.posts and len(run_bridge.aborts) == 1
+        claim, abort = run_bridge.claims[0], run_bridge.aborts[0]
+        assert claim["run_id"] == abort["run_id"] and claim["revoke_secret"] == abort["revoke_secret"]
+        assert claim["request_id"] != abort["request_id"]
+    finally:
+        run_bridge.claim_release.set()
+
+
+@pytest.mark.parametrize("fault", [
+    "lost_fifth", "final_epoch", "read_type", "wrong_address", "reuse_capability", "wrong_identity",
+    "wrong_version", "early_cycle_capability", "bad_limits", "duplicate_keys", "short_grant", "oversize",
+])
+async def test_finite_run_rejects_bad_responses_and_aborts_without_publishing(
+    hass, run_bridge, hass_admin_user, fault
+):
+    entry, _ = await _load_run_entry(hass, run_bridge)
+    context = Context(user_id=hass_admin_user.id)
+
+    def mutate(action, payload, reply):
+        if action == "read":
+            if fault == "read_type":
+                reply["result"][0]["value"] = True
+            elif fault == "wrong_address":
+                reply["result"][0]["piid"] = 7
+            elif fault == "reuse_capability":
+                reply["continuation"] = payload["cycle_capability"]
+            elif fault == "wrong_identity":
+                reply["run_id"] = "c" * 32
+            elif fault == "wrong_version":
+                reply["version"] = 1
+            elif fault == "early_cycle_capability":
+                reply["next_cycle_capability"] = "c" * 32
+        elif action == "claim" and fault == "bad_limits":
+            reply["cycle"] = True
+        return reply
+
+    run_bridge.mutate_response = mutate
+    if fault == "lost_fifth":
+        run_bridge.last_read_status = 503
+    elif fault == "final_epoch":
+        run_bridge.read_state = _state(_property("0", 2, 2), epoch=_NEW_EPOCH, sequence=1)
+    elif fault == "short_grant":
+        run_bridge.remaining_ms = 44_999
+    elif fault == "duplicate_keys":
+        run_bridge.raw_claim = ', "cycle": 1}'
+    elif fault == "oversize":
+        run_bridge.raw_claim = "}" + " " * 2048
+    if fault in ("bad_limits", "short_grant", "duplicate_keys", "oversize"):
+        with pytest.raises(HomeAssistantError):
+            await _run_action(hass, entry, context)
+    else:
+        await _run_action(hass, entry, context)
+    failed = await _wait_for_run_state(hass, "failed")
+    assert failed.attributes["completed_cycles"] == 0
+    await hass.async_block_till_done()
+    _assert_no_refresh(hass)
+    assert len(run_bridge.aborts) == 1
+    assert len(run_bridge.posts) == (
+        5 if fault in ("lost_fifth", "final_epoch")
+        else 0 if fault in ("bad_limits", "short_grant", "duplicate_keys", "oversize")
+        else 1
+    )
+    if run_bridge.claims:
+        exported = str(failed.attributes) + str(await async_get_config_entry_diagnostics(hass, entry))
+        for secret in ("run_id", "request_id", "revoke_secret"):
+            assert run_bridge.claims[0][secret] not in exported
+
+
+@pytest.mark.parametrize("stop", ["cancel", "epoch", "late", "busy", "insufficient", "reload", "grant_expired"])
+async def test_finite_run_wait_ends_without_catch_up_or_new_claim(
+    hass, run_bridge, hass_admin_user, advance_loop, stop
+):
+    if stop == "insufficient":
+        run_bridge.remaining_ms = 169_999
+    entry, coordinator = await _load_run_entry(hass, run_bridge)
+    context = Context(user_id=hass_admin_user.id)
+    await _run_action(hass, entry, context)
+    if stop != "insufficient":
+        await _wait_for_run_state(hass, "waiting")
+    expected, reason = "failed", None
+    if stop == "cancel":
+        await _run_action(hass, entry, context, SERVICE_CANCEL_LOCAL_STATE_REFRESH_RUN)
+        expected, reason = "cancelled", "requested"
+    elif stop == "epoch":
+        run_bridge.state = _state(_property("0", 2, 2), epoch=_NEW_EPOCH, sequence=1)
+        await _refresh(hass, coordinator)
+        reason = "epoch_changed"
+    elif stop == "late":
+        await advance_loop(131)
+        reason = "wake_late"
+    elif stop == "busy":
+        coordinator._busy = True
+        await advance_loop(126)
+        coordinator._busy = False
+        reason = "bridge_busy"
+    elif stop == "insufficient":
+        reason = "insufficient_grant"
+    elif stop == "grant_expired":
+        await advance_loop(601)
+        reason = "grant_expired"
+    else:
+        assert await hass.config_entries.async_reload(entry.entry_id)
+        await hass.async_block_till_done()
+        expected = "inactive"
+    progress = await _wait_for_run_state(hass, expected)
+    assert progress.attributes["reason"] == reason
+    _assert_no_refresh(hass)
+    with pytest.raises(HomeAssistantError, match="already been used"):
+        await _run_action(hass, entry, context)
+    await hass.async_block_till_done()
+    assert len(run_bridge.claims) == 1 and len(run_bridge.posts) == 5
+    assert len(run_bridge.aborts) == 1
+
+
+async def test_finite_run_handles_cancellation_before_background_task_entry(
+    hass, run_bridge, hass_admin_user
+):
+    entry, coordinator = await _load_run_entry(hass, run_bridge)
+    context = Context(user_id=hass_admin_user.id)
+    create_background_task = type(entry).async_create_background_task
+
+    def cancel_before_start(self, hass, target, name, eager_start=True):
+        task = create_background_task(self, hass, target, name, eager_start)
+        if name == "local state refresh run":
+            assert not eager_start
+            task.cancel()
+        return task
+
+    with patch.object(type(entry), "async_create_background_task", cancel_before_start):
+        accepted = await _run_action(hass, entry, context)
+    assert accepted["state"] == "starting"
+    await _wait_for_run_state(hass, "cancelled")
+    await hass.async_block_till_done()
+    assert coordinator._run is None
+    assert len(run_bridge.claims) == len(run_bridge.aborts) == 1
+    assert not run_bridge.posts
+
+
+async def test_finite_run_cancels_a_pending_read_with_one_abort(
+    hass, run_bridge, hass_admin_user
+):
+    entry, coordinator = await _load_run_entry(hass, run_bridge)
+    run_bridge.hold_read_at = 3
+    run_bridge.read_release = Event()
+    context = Context(user_id=hass_admin_user.id)
+    await _run_action(hass, entry, context)
+    try:
+        await wait_for(run_bridge.read_started.wait(), 2)
+        assert hass.states.get(_RUN_SENSOR).state == "sampling"
+        assert coordinator._run is not None
+        assert (await _run_action(hass, entry, context, SERVICE_CANCEL_LOCAL_STATE_REFRESH_RUN))["state"] == "cancelled"
+        assert coordinator._run is None
+        assert not run_bridge.read_release.is_set()
+        assert len(run_bridge.aborts) == 1
+    finally:
+        run_bridge.read_release.set()
+    await hass.async_block_till_done()
+    _assert_no_refresh(hass)
+    assert len(run_bridge.posts) == 3
+
+
+async def test_finite_run_wake_tolerance_is_not_a_read_deadline(
+    hass, run_bridge, hass_admin_user, advance_loop
+):
+    entry, _ = await _load_run_entry(hass, run_bridge)
+    context = Context(user_id=hass_admin_user.id)
+    await _run_action(hass, entry, context)
+    await _wait_for_run_state(hass, "waiting")
+    expected_due = run_bridge.request_times[-1] + 125
+    await advance_loop(120, smooth=True)
+    while hass.loop.time() < expected_due - 3:
+        await advance_loop(0.25)
+    run_bridge.hold_read_at = 6
+    run_bridge.read_started.clear()
+    run_bridge.read_release = Event()
+    try:
+        await advance_loop(expected_due + 2 - hass.loop.time())
+        await wait_for(run_bridge.read_started.wait(), 2)
+        await advance_loop(4)
+        run_bridge.read_release.set()
+        await _wait_for_run_state(hass, "waiting")
+        assert hass.states.get(_RUN_SENSOR).attributes["completed_cycles"] == 2
+        assert run_bridge.request_times[6] > expected_due + 5
+        assert len(run_bridge.posts) == 10
+        assert not run_bridge.aborts
+    finally:
+        run_bridge.read_release.set()
+
+
+async def test_finite_run_cancel_before_claim_dispatch_sends_no_control_post(
+    hass, run_bridge, hass_admin_user
+):
+    entry, coordinator = await _load_run_entry(hass, run_bridge)
+    started = Event()
+
+    async def hold_passive_request():
+        started.set()
+        await Event().wait()
+
+    context = Context(user_id=hass_admin_user.id)
+    with patch.object(coordinator._bridge, "async_get_state", hold_passive_request):
+        pending = hass.async_create_task(_run_action(hass, entry, context))
+        await wait_for(started.wait(), 2)
+        progress = await _run_action(hass, entry, context, SERVICE_CANCEL_LOCAL_STATE_REFRESH_RUN)
+        assert progress["state"] == "cancelled"
+        with pytest.raises(CancelledError):
+            await wait_for(pending, 2)
+    assert coordinator._run is None
+    assert not run_bridge.claims and not run_bridge.posts and not run_bridge.aborts
+    with pytest.raises(HomeAssistantError, match="already been used"):
+        await _run_action(hass, entry, context)
+
+
+@pytest.mark.parametrize("at_state", ["starting", "sampling"])
+async def test_finite_run_releases_busy_if_progress_notification_raises(
+    hass, run_bridge, hass_admin_user, at_state
+):
+    entry, coordinator = await _load_run_entry(hass, run_bridge)
+    context = Context(user_id=hass_admin_user.id)
+    original = coordinator.async_update_listeners
+    failed = False
+
+    def notify():
+        nonlocal failed
+        if not failed and coordinator.refresh_run_progress["state"] == at_state:
+            failed = True
+            raise RuntimeError("Progress notification failed")
+        original()
+
+    with patch.object(coordinator, "async_update_listeners", notify):
+        if at_state == "starting":
+            with pytest.raises(HomeAssistantError, match="claim failed"):
+                await _run_action(hass, entry, context)
+        else:
+            await _run_action(hass, entry, context)
+        await _wait_for_run_state(hass, "failed")
+    await hass.async_block_till_done()
+    assert failed and not coordinator._busy and coordinator._run is None
+    gets = run_bridge.gets
+    await _refresh(hass, coordinator)
+    assert run_bridge.gets == gets + 1
+    assert not run_bridge.posts
+    assert len(run_bridge.aborts) == (1 if at_state == "sampling" else 0)

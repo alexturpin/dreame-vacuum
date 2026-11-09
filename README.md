@@ -97,9 +97,18 @@ robot reads. See [read modes and freshness](docs/LOCAL_BRIDGE.md#read-modes)
 for the result schema and failure behavior. This mode adds no periodic robot
 polling or vacuum controls.
 
+### Finite state refresh run
+
+A bridge owner can authorize up to three five-property cycles within one
+ten-minute grant. A direct administrator action claims the grant once and
+subsequent cycles run 125 seconds apart after validation. The progress
+sensor and fresh solicited snapshot are separate diagnostics. See
+[read modes and freshness](docs/LOCAL_BRIDGE.md#read-modes) for the pinned
+HTTPS requirement, start and cancel actions, and run limits.
+
 ### Bridge contract
 
-Both endpoints require the configured bearer token. The client disables
+All endpoints require the configured bearer token. The client disables
 redirects and environment proxies.
 
 - `GET /v1/state` returns `version`, `epoch`, `connected`, `ready`, `sequence`,
@@ -129,6 +138,13 @@ redirects and environment proxies.
   The battery action uses the original request and reply fields. An error
   reply carries `version`, `request_id`, `epoch`, and `error`. A refusal or
   transport or protocol failure ends the trial for that client and epoch.
+- The finite run uses `POST /v2/refresh/claim`, `POST /v2/refresh/read` and
+  `POST /v2/refresh/abort` on the pinned HTTPS bridge. Claim and abort carry
+  a run identity, epoch and revoke proof. The owner returns a one-use cycle
+  capability on claim and on successful fifth reads for cycles one and two.
+  A cycle capability permits only its first read. Later requests use the
+  continuation from the previous validated reply. Passive readiness stays
+  on `GET /v1/state`.
 
 ### Offline verification
 

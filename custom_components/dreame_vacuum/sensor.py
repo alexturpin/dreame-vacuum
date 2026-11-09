@@ -675,8 +675,10 @@ async def async_setup_entry(
     coordinator = hass.data[DOMAIN][entry.entry_id]
     if is_local_bridge(entry.data):
         entities = [LocalBridgeBattery(coordinator)]
-        if coordinator.state_refresh_enabled:
+        if coordinator.state_refresh_enabled or coordinator.state_refresh_run_enabled:
             entities.append(LocalBridgeStateRefresh(coordinator))
+        if coordinator.state_refresh_run_enabled:
+            entities.append(LocalBridgeStateRefreshRun(coordinator))
         async_add_entities(entities)
         return
 
@@ -750,3 +752,27 @@ class LocalBridgeStateRefresh(LocalBridgeEntity, SensorEntity):
     @property
     def extra_state_attributes(self) -> dict | None:
         return deepcopy(self.coordinator.refresh_snapshot)
+
+
+class LocalBridgeStateRefreshRun(LocalBridgeEntity, SensorEntity):
+    """Expose finite run progress independently of solicited snapshot freshness."""
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_translation_key = "local_state_refresh_run"
+
+    def __init__(self, coordinator: LocalBridgeCoordinator) -> None:
+        super().__init__(coordinator, "local_state_refresh_run")
+
+    @property
+    def available(self) -> bool:
+        return True
+
+    @property
+    def native_value(self) -> str:
+        return self.coordinator.refresh_run_progress["state"]
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        progress = self.coordinator.refresh_run_progress
+        progress.pop("state")
+        return progress

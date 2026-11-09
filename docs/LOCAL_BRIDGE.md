@@ -25,7 +25,7 @@ coordinator refuses overlapping reads while it awaits the snapshot or reply.
 
 ## Read modes
 
-The Local MQTT Bridge configuration and reconfiguration form offers two modes
+The Local MQTT Bridge configuration and reconfiguration form offers three modes
 under **Read mode**. **Legacy individual reads** is the default and preserves
 the battery action and the separate five-property trial actions. The battery
 action uses its own one-shot bridge authorization. The legacy property trial
@@ -68,6 +68,33 @@ unload clears it. It starts unavailable after Home Assistant starts or the
 entry reloads. Setup, ordinary updates, and the expiry timer send zero
 property read requests. Passive vacuum and battery entities use their own
 telemetry and the local vacuum exposes zero control features.
+
+**Finite state refresh run** requires a pinned HTTPS bridge and an owner
+configured with a startup `state_refresh_run` grant. A direct authenticated
+administrator can call `dreame_vacuum.start_local_state_refresh_run` with
+only `config_entry_id`. The grant allows up to three ordered five-property
+cycles and expires within ten minutes of owner startup. The integration
+starts each later cycle 125 seconds after the previous cycle's final
+validation, provided a full 45-second cycle still fits and the wake is no
+more than five seconds late. Ordinary passive polling continues between
+cycles. Each successful cycle updates **Local state refresh**, with the
+same 60-second freshness limit.
+
+**Local state refresh run** shows progress independently of the snapshot.
+The start action can return the current progress, and the sensor shows
+completed cycles, the next due time, grant expiry and any terminal reason.
+If the start response is lost, inspect the progress sensor. Home Assistant
+can finish an accepted service call after its caller disconnects.
+A direct administrator can call `dreame_vacuum.cancel_local_state_refresh_run`
+with the same entry ID. Cancellation clears active state immediately and
+attempts one bounded revocation request. The owner independently enforces
+grant expiry and request limits if that request cannot be delivered.
+
+The entry accepts one start per Home Assistant process, including across
+reloads. It starts inactive after setup, and the grant capabilities stay in
+memory. Reload, shutdown, session change, invalid replies and timing
+failures end the active run. The integration does not recover a lost
+capability or start another run automatically.
 
 ## Upstream protocol seam
 

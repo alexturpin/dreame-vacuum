@@ -32,6 +32,22 @@ refresh_local_state:
         config_entry:
           integration: dreame_vacuum
 
+start_local_state_refresh_run:
+  fields:
+    config_entry_id:
+      required: true
+      selector:
+        config_entry:
+          integration: dreame_vacuum
+
+cancel_local_state_refresh_run:
+  fields:
+    config_entry_id:
+      required: true
+      selector:
+        config_entry:
+          integration: dreame_vacuum
+
 vacuum_clean_segment:
   target:
     entity:

@@ -33,9 +33,11 @@ logging.getLogger("homeassistant.util.logging").addFilter(
 
 from .coordinator import DreameVacuumDataUpdateCoordinator
 from .local_bridge import (
+    SERVICE_CANCEL_LOCAL_STATE_REFRESH_RUN,
     SERVICE_READ_LOCAL_BATTERY,
     SERVICE_READ_LOCAL_PROPERTY,
     SERVICE_REFRESH_LOCAL_STATE,
+    SERVICE_START_LOCAL_STATE_REFRESH_RUN,
     LocalBridgeCoordinator,
     async_register_local_read,
     is_local_bridge,
@@ -105,6 +107,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         coordinators = hass.data[DOMAIN]
         coordinator: LocalBridgeCoordinator = coordinators[entry.entry_id]
         coordinator.async_cancel_refresh()
+        await coordinator.async_cancel_refresh_run("entry_unloaded")
         if not await hass.config_entries.async_unload_platforms(entry, LOCAL_BRIDGE_PLATFORMS):
             return False
         coordinators.pop(entry.entry_id)
@@ -112,6 +115,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             hass.services.async_remove(DOMAIN, SERVICE_READ_LOCAL_BATTERY)
             hass.services.async_remove(DOMAIN, SERVICE_READ_LOCAL_PROPERTY)
             hass.services.async_remove(DOMAIN, SERVICE_REFRESH_LOCAL_STATE)
+            hass.services.async_remove(DOMAIN, SERVICE_START_LOCAL_STATE_REFRESH_RUN)
+            hass.services.async_remove(DOMAIN, SERVICE_CANCEL_LOCAL_STATE_REFRESH_RUN)
         await coordinator.async_close()
         return True
 
