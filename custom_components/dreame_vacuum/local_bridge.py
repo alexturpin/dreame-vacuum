@@ -18,6 +18,7 @@ from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import timedelta
+from hashlib import sha256
 from ipaddress import ip_address, ip_network
 import json
 import re
@@ -56,13 +57,23 @@ CONF_BRIDGE_URL = "bridge_url"
 CONF_BRIDGE_TOKEN = "bridge_token"
 CONF_BRIDGE_FINGERPRINT = "bridge_fingerprint"
 CONF_BRIDGE_READ_MODE = "bridge_read_mode"
+READ_MODE_PASSIVE = "passive"
 READ_MODE_LEGACY = "legacy"
 READ_MODE_STATE_REFRESH = "state_refresh"
 READ_MODE_STATE_REFRESH_RUN = "state_refresh_run"
-BRIDGE_READ_MODES = (READ_MODE_LEGACY, READ_MODE_STATE_REFRESH, READ_MODE_STATE_REFRESH_RUN)
+READ_MODE_DURABLE_REFRESH = "durable_refresh"
+_RUN_MODES = (READ_MODE_STATE_REFRESH_RUN, READ_MODE_DURABLE_REFRESH)
+BRIDGE_READ_MODES = (
+    READ_MODE_PASSIVE,
+    READ_MODE_DURABLE_REFRESH,
+    READ_MODE_LEGACY,
+    READ_MODE_STATE_REFRESH,
+    READ_MODE_STATE_REFRESH_RUN,
+)
 SERVICE_READ_LOCAL_BATTERY = "read_local_battery"
 SERVICE_READ_LOCAL_PROPERTY = "read_local_property"
 SERVICE_REFRESH_LOCAL_STATE = "refresh_local_state"
+SERVICE_PREPARE_LOCAL_STATE_REFRESH_RUN = "prepare_local_state_refresh_run"
 SERVICE_START_LOCAL_STATE_REFRESH_RUN = "start_local_state_refresh_run"
 SERVICE_CANCEL_LOCAL_STATE_REFRESH_RUN = "cancel_local_state_refresh_run"
 CONF_ENTRY_ID = "config_entry_id"
@@ -137,12 +148,22 @@ def is_local_bridge(data: Mapping[str, Any]) -> bool:
     return data.get(CONF_ACCOUNT_TYPE) == ACCOUNT_TYPE_LOCAL_BRIDGE
 
 
-def _read_label(property_name: str, value: int) -> str | None:
+def bridge_state(value: int) -> DreameVacuumState | None:
+    """Decode the local bridge's known state range."""
+    if value == 0:
+        return DreameVacuumState.CHARGING_COMPLETED
+    if 1 <= value <= 18:
+        return DreameVacuumState(value)
+    return None
+
+
+def bridge_property_label(property_name: str, value: int) -> str | None:
+    """Translate a reported value without applying upstream derived status."""
     if property_name == "state":
-        if value == 0:
-            value = DreameVacuumState.CHARGING_COMPLETED
-        elif not 1 <= value <= 18:
+        state = bridge_state(value)
+        if state is None:
             return None
+        value = state
     label = _READ_LABELS[property_name].get(value)
     return None if label == STATE_UNKNOWN else label
 
@@ -235,13 +256,14 @@ class LocalBridgeClient:
             raise ValueError("Local bridge connections cannot use environment proxies")
         self._session = session
         self._url = validate_bridge_url(data[CONF_BRIDGE_URL])
+        self._read_mode = data.get(CONF_BRIDGE_READ_MODE, READ_MODE_PASSIVE)
         token = data[CONF_BRIDGE_TOKEN]
         pin = data.get(CONF_BRIDGE_FINGERPRINT, "").strip().replace(":", "").lower()
         if not _TOKEN.fullmatch(token):
             raise ValueError("Invalid local bridge bearer token")
         if pin and (self._url.scheme != "https" or not _FINGERPRINT.fullmatch(pin)):
             raise ValueError("Invalid local bridge certificate fingerprint")
-        if data.get(CONF_BRIDGE_READ_MODE) == READ_MODE_STATE_REFRESH_RUN and not pin:
+        if self._read_mode in _RUN_MODES and not pin:
             raise ValueError("Local refresh runs require a pinned HTTPS bridge")
         self._ssl = Fingerprint(bytes.fromhex(pin)) if pin else True
         self._headers = {"Authorization": f"Bearer {token}", "Cache-Control": "no-store"}
@@ -402,8 +424,11 @@ class LocalBridgeClient:
         self, epoch: str, run_id: str, revoke_secret: str, timeout: float
     ) -> tuple[int, str]:
         """Exchange one claim for its initial cycle capability and grant lifetime."""
+        mode = self._read_mode
+        if mode not in _RUN_MODES:
+            raise LocalBridgeError("The local bridge is not configured for a refresh run")
         response = await self._async_run_request(
-            "claim", epoch, run_id, {"mode": READ_MODE_STATE_REFRESH_RUN, "revoke_secret": revoke_secret}, timeout
+            "claim", epoch, run_id, {"mode": mode, "revoke_secret": revoke_secret}, timeout
         )
         limits = {
             "max_cycles": _RUN_MAX_CYCLES,
@@ -413,7 +438,7 @@ class LocalBridgeClient:
         }
         if (
             response.keys() != limits.keys() | {"mode", "remaining_grant_ms", "cycle_capability"}
-            or response["mode"] != READ_MODE_STATE_REFRESH_RUN
+            or response["mode"] != mode
             or any(type(response[key]) is not int or response[key] != value for key, value in limits.items())
             or type(response["remaining_grant_ms"]) is not int
             or not 0 < response["remaining_grant_ms"] <= _RUN_MAX_SECONDS * 1000
@@ -487,7 +512,7 @@ class _RefreshRun:
     run_id: str
     revoke_secret: str | None
     task: Task | None
-    claim_sent: bool = False
+    may_be_armed: bool = False
     deadline: float = 0
     capability: str | None = None
     continuation: str | None = None
@@ -505,7 +530,7 @@ class LocalBridgeCoordinator(DataUpdateCoordinator[DreameVacuumDevice]):
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         self._bridge = LocalBridgeClient(async_get_clientsession(hass), entry.data)
-        self._read_mode = entry.data.get(CONF_BRIDGE_READ_MODE, READ_MODE_LEGACY)
+        self._read_mode = entry.data.get(CONF_BRIDGE_READ_MODE, READ_MODE_PASSIVE)
         super().__init__(
             hass, LOGGER, config_entry=entry, name=DOMAIN, update_interval=timedelta(seconds=10)
         )
@@ -520,6 +545,9 @@ class LocalBridgeCoordinator(DataUpdateCoordinator[DreameVacuumDevice]):
         self._refresh_task: Task | None = None
         self._refresh_expiry: TimerHandle | None = None
         self._refresh_snapshot: dict[str, Any] | None = None
+        self._prepare_task: Task | None = None
+        self._prepared_run: _RefreshRun | None = None
+        self._prepare_expiry: TimerHandle | None = None
         self._run: _RefreshRun | None = None
         self._run_abort_task: Task | None = None
         self._run_progress = {
@@ -541,7 +569,11 @@ class LocalBridgeCoordinator(DataUpdateCoordinator[DreameVacuumDevice]):
 
     @property
     def state_refresh_run_enabled(self) -> bool:
-        return self._read_mode == READ_MODE_STATE_REFRESH_RUN
+        return self._read_mode in _RUN_MODES
+
+    @property
+    def durable_refresh_enabled(self) -> bool:
+        return self._read_mode == READ_MODE_DURABLE_REFRESH
 
     @property
     def refresh_run_progress(self) -> dict[str, Any]:
@@ -609,6 +641,8 @@ class LocalBridgeCoordinator(DataUpdateCoordinator[DreameVacuumDevice]):
             self._seal_read_trial()
 
     def _fail_refresh_run(self, reason: str) -> None:
+        if self._prepared_run is not None:
+            self._end_prepared_run("failed", reason)
         if self._run is not None:
             self._end_refresh_run(self._run, "failed", reason)
 
@@ -645,7 +679,9 @@ class LocalBridgeCoordinator(DataUpdateCoordinator[DreameVacuumDevice]):
             self.device.apply_local_bridge_properties(state.properties)
         except CancelledError:
             self._invalidate_snapshot()
-            if self._run is not None and self._run.task is not current_task():
+            if self._prepared_run is not None or (
+                self._run is not None and self._run.task is not current_task()
+            ):
                 self._fail_refresh_run("passive_check_cancelled")
             raise
         except LocalBridgeError:
@@ -762,7 +798,7 @@ class LocalBridgeCoordinator(DataUpdateCoordinator[DreameVacuumDevice]):
                         started,
                         {
                             "value": value,
-                            "label": _read_label(name, value),
+                            "label": bridge_property_label(name, value),
                             "requested_at": requested_at,
                             "responded_at": responded_at,
                         },
@@ -829,15 +865,18 @@ class LocalBridgeCoordinator(DataUpdateCoordinator[DreameVacuumDevice]):
             task.cancel()
         if state != "completed":
             self._clear_refresh_snapshot()
-            if run.claim_sent and revoke_secret is not None:
-                deadline = self.hass.loop.time() + _RUN_CONTROL_TIMEOUT
-                self._run_abort_task = self.config_entry.async_create_task(
-                    self.hass,
-                    self._async_abort_refresh_run(run.epoch, run.run_id, revoke_secret, deadline),
-                    "abort local state refresh run",
-                    eager_start=False,
-                )
+            if run.may_be_armed and revoke_secret is not None:
+                self._schedule_refresh_run_abort(run, revoke_secret)
         self._set_run_progress(state, reason=reason)
+
+    def _schedule_refresh_run_abort(self, run: _RefreshRun, revoke_secret: str) -> None:
+        deadline = self.hass.loop.time() + _RUN_CONTROL_TIMEOUT
+        self._run_abort_task = self.config_entry.async_create_task(
+            self.hass,
+            self._async_abort_refresh_run(run.epoch, run.run_id, revoke_secret, deadline),
+            "abort local state refresh run",
+            eager_start=False,
+        )
 
     async def _async_abort_refresh_run(
         self, epoch: str, run_id: str, revoke_secret: str, deadline: float
@@ -854,8 +893,17 @@ class LocalBridgeCoordinator(DataUpdateCoordinator[DreameVacuumDevice]):
             self._run_abort_task = None
 
     @callback
+    def _cancel_prepare_task(self) -> None:
+        task, self._prepare_task = self._prepare_task, None
+        if task is not None and not task.cancelling():
+            task.cancel()
+
+    @callback
     def _async_stop_refresh_run(self, _: Event) -> None:
-        if self._run is not None:
+        self._cancel_prepare_task()
+        if self._prepared_run is not None:
+            self._end_prepared_run("cancelled", "home_assistant_stopped")
+        elif self._run is not None:
             self._end_refresh_run(self._run, "cancelled", "home_assistant_stopped")
         elif self._refresh_snapshot is not None:
             self._clear_refresh_snapshot()
@@ -863,11 +911,77 @@ class LocalBridgeCoordinator(DataUpdateCoordinator[DreameVacuumDevice]):
 
     async def async_cancel_refresh_run(self, reason: str = "requested") -> dict[str, Any]:
         """Invalidate the run immediately and wait for at most one bounded abort."""
-        if self._run is not None:
+        self._cancel_prepare_task()
+        if self._prepared_run is not None:
+            self._end_prepared_run("cancelled", reason)
+        elif self._run is not None:
             self._end_refresh_run(self._run, "cancelled", reason)
+        elif self.durable_refresh_enabled and self._refresh_snapshot is not None:
+            self._clear_refresh_snapshot()
+            self.async_update_listeners()
         if self._run_abort_task is not None:
             await shield(self._run_abort_task)
         return self.refresh_run_progress
+
+    def _take_prepared_run(self) -> _RefreshRun:
+        run, self._prepared_run = self._prepared_run, None
+        if self._prepare_expiry is not None:
+            self._prepare_expiry.cancel()
+            self._prepare_expiry = None
+        return cast(_RefreshRun, run)
+
+    @callback
+    def _end_prepared_run(self, state: str, reason: str) -> None:
+        run = self._take_prepared_run()
+        revoke_secret, run.revoke_secret = run.revoke_secret, None
+        self._clear_refresh_snapshot()
+        self._schedule_refresh_run_abort(run, cast(str, revoke_secret))
+        self._set_run_progress(state, reason=reason)
+
+    async def async_prepare_refresh_run(self) -> dict[str, str]:
+        """Create a volatile run binding for an independent owner-side arm."""
+        if not self.durable_refresh_enabled:
+            raise LocalBridgeError("Preparing a refresh run requires the durable refresh bridge mode")
+        entry = self.config_entry
+        if self._closed or self.hass.is_stopping or entry.state is not ConfigEntryState.LOADED:
+            raise LocalBridgeError("The local bridge entry is unloaded or Home Assistant is stopping")
+        if self._busy or self._run is not None or self._run_abort_task is not None:
+            raise LocalBridgeError("The local bridge is busy")
+        if self._prepared_run is not None:
+            raise LocalBridgeError("A local refresh run is already prepared")
+        self._busy = True
+        task = self._prepare_task = current_task()
+        try:
+            await self._async_apply_snapshot()
+            if self._prepare_task is not task:
+                raise CancelledError
+            if self._closed or self.hass.is_stopping or entry.state is not ConfigEntryState.LOADED:
+                raise LocalBridgeError("The local bridge entry is unloaded or Home Assistant is stopping")
+            if self._epoch is None or not self.device.available:
+                raise LocalBridgeError("The local bridge has no fresh telemetry")
+            run = _RefreshRun(self._epoch, token_hex(16), token_hex(16), None, may_be_armed=True)
+            run.deadline = self.hass.loop.time() + _RUN_MAX_SECONDS
+            self._prepared_run = run
+            self._prepare_expiry = self.hass.loop.call_at(
+                run.deadline, self._end_prepared_run, "failed", "preparation_expired"
+            )
+            try:
+                self._set_run_progress(
+                    "prepared", completed_cycles=0, expires_at=self._run_display_time(run.deadline)
+                )
+            except Exception:
+                self._end_prepared_run("failed", "prepare_failed")
+                raise LocalBridgeError("The local refresh run preparation failed") from None
+            return {
+                "epoch": run.epoch,
+                "run_id": run.run_id,
+                "revoke_commitment": sha256(cast(str, run.revoke_secret).encode("ascii")).hexdigest(),
+            }
+        finally:
+            self._prepare_task = None
+            self._busy = False
+            if not self._closed and entry.state is ConfigEntryState.LOADED:
+                self.async_set_updated_data(self.device)
 
     async def async_start_refresh_run(self) -> dict[str, Any]:
         """Claim once, then hand the finite run to the loaded config entry."""
@@ -876,30 +990,43 @@ class LocalBridgeCoordinator(DataUpdateCoordinator[DreameVacuumDevice]):
         entry = self.config_entry
         if self._closed or self.hass.is_stopping or entry.state is not ConfigEntryState.LOADED:
             raise LocalBridgeError("The local bridge entry is unloaded or Home Assistant is stopping")
-        attempts = self.hass.data.setdefault(_RUN_ATTEMPTS, set())
         if self._busy:
             raise LocalBridgeError("The local bridge is busy")
-        if entry.entry_id in attempts:
-            raise LocalBridgeError("The local refresh run attempt has already been used")
-        attempts.add(entry.entry_id)
 
-        epoch = self._epoch
-        if epoch is None or not self.device.available:
-            self._set_run_progress("failed", reason="bridge_not_ready")
-            raise LocalBridgeError("The local bridge has no fresh telemetry")
         clock = self.hass.loop.time
+        if self.durable_refresh_enabled:
+            if self._run is not None or self._run_abort_task is not None:
+                raise LocalBridgeError("The local bridge is busy")
+            if self._prepared_run is None:
+                raise LocalBridgeError("Prepare and arm a new local refresh run first")
+            if clock() >= self._prepared_run.deadline:
+                self._end_prepared_run("failed", "preparation_expired")
+                raise LocalBridgeError("The local refresh run preparation expired")
+            run = self._take_prepared_run()
+            run.task = current_task()
+            self._clear_refresh_snapshot()
+        else:
+            attempts = self.hass.data.setdefault(_RUN_ATTEMPTS, set())
+            if entry.entry_id in attempts:
+                raise LocalBridgeError("The local refresh run attempt has already been used")
+            attempts.add(entry.entry_id)
+            epoch = self._epoch
+            if epoch is None or not self.device.available:
+                self._set_run_progress("failed", reason="bridge_not_ready")
+                raise LocalBridgeError("The local bridge has no fresh telemetry")
+            run = _RefreshRun(epoch, token_hex(16), token_hex(16), current_task())
+
         started = clock()
         control_deadline = started + _RUN_CONTROL_TIMEOUT
-        run = _RefreshRun(epoch, token_hex(16), token_hex(16), current_task())
         run.deadline = started + _RUN_MAX_SECONDS
         self._run = run
         self._busy = True
         try:
-            self._set_run_progress("starting")
+            self._set_run_progress("starting", completed_cycles=0, expires_at=None)
             async with timeout_at(control_deadline):
                 await self._async_apply_snapshot()
                 claim_started = self._require_refresh_run(run, control_deadline)
-                run.claim_sent = True
+                run.may_be_armed = True
                 remaining_ms, capability = await self._bridge.async_claim_refresh_run(
                     run.epoch,
                     run.run_id,
@@ -1007,7 +1134,7 @@ class LocalBridgeCoordinator(DataUpdateCoordinator[DreameVacuumDevice]):
                 started,
                 {
                     "value": value,
-                    "label": _read_label(name, value),
+                    "label": bridge_property_label(name, value),
                     "requested_at": requested_at,
                     "responded_at": dt_util.utcnow().isoformat(),
                 },
@@ -1023,11 +1150,11 @@ class LocalBridgeCoordinator(DataUpdateCoordinator[DreameVacuumDevice]):
         """Clear the device state and stop coordinator scheduling."""
         self._closed = True
         self._read_continuation = None
-        task = self._refresh_task
+        tasks = [task for task in (self._prepare_task, self._refresh_task) if task is not None]
         self.async_cancel_refresh()
         await self.async_cancel_refresh_run("entry_unloaded")
-        if task is not None:
-            await gather(task, return_exceptions=True)
+        if tasks:
+            await gather(*tasks, return_exceptions=True)
         self.device.disconnect()
         await self.async_shutdown()
 
@@ -1093,6 +1220,18 @@ def async_register_local_read(hass: HomeAssistant) -> None:
 
     async def async_cancel_refresh_run(call: ServiceCall) -> dict[str, Any]:
         return await get_run_coordinator(call).async_cancel_refresh_run()
+
+    async def async_prepare_refresh_run(call: ServiceCall) -> dict[str, str]:
+        return await get_run_coordinator(call).async_prepare_refresh_run()
+
+    async_register_admin_service(
+        hass,
+        DOMAIN,
+        SERVICE_PREPARE_LOCAL_STATE_REFRESH_RUN,
+        async_prepare_refresh_run,
+        schema=vol.Schema({vol.Required(CONF_ENTRY_ID): str}),
+        supports_response=SupportsResponse.ONLY,
+    )
 
     for service, handler in (
         (SERVICE_START_LOCAL_STATE_REFRESH_RUN, async_start_refresh_run),

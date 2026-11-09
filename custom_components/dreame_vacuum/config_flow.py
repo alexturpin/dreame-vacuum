@@ -64,7 +64,7 @@ from .local_bridge import (
     CONF_BRIDGE_URL,
     LocalBridgeClient,
     LocalBridgeError,
-    READ_MODE_LEGACY,
+    READ_MODE_PASSIVE,
     is_local_bridge,
     validate_bridge_url,
 )
@@ -402,7 +402,7 @@ class DreameVacuumFlowHandler(ConfigFlow, domain=DOMAIN):
         """Configure a bridge without connecting to the robot or a cloud account."""
         errors = {}
         defaults = self.entry.data if self.entry is not None else {}
-        read_mode = defaults.get(CONF_BRIDGE_READ_MODE, READ_MODE_LEGACY)
+        read_mode = defaults.get(CONF_BRIDGE_READ_MODE, READ_MODE_PASSIVE)
         if user_input is not None:
             name = user_input[CONF_NAME].strip()
             try:

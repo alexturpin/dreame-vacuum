@@ -210,6 +210,8 @@
     },
     "bridge_read_mode": {
       "options": {
+        "passive": "Passive telemetry only",
+        "durable_refresh": "Durable state refresh",
         "legacy": "Legacy individual reads",
         "state_refresh": "Bounded state refresh",
         "state_refresh_run": "Finite state refresh run"
@@ -808,6 +810,12 @@
       },
       "battery_level": {
         "name": "Battery Level"
+      },
+      "local_passive_state": {
+        "name": "Local passive state"
+      },
+      "local_passive_status": {
+        "name": "Local passive status"
       },
       "local_state_refresh": {
         "name": "Local state refresh"
@@ -2691,13 +2699,23 @@
     }
   },
   "services": {
+    "prepare_local_state_refresh_run": {
+      "name": "Prepare local state refresh run",
+      "description": "Prepare a durable refresh run for independent authorization on the bridge owner.",
+      "fields": {
+        "config_entry_id": {
+          "name": "Local MQTT Bridge entry",
+          "description": "The ID of the loaded bridge entry configured for durable state refresh."
+        }
+      }
+    },
     "start_local_state_refresh_run": {
       "name": "Start local state refresh run",
       "description": "Claim one authorized run of up to three five-property cycles.",
       "fields": {
         "config_entry_id": {
           "name": "Local MQTT Bridge entry",
-          "description": "The ID of the loaded bridge entry configured for a finite refresh run."
+          "description": "The ID of the loaded bridge entry configured for durable or finite refresh runs."
         }
       }
     },
@@ -2707,7 +2725,7 @@
       "fields": {
         "config_entry_id": {
           "name": "Local MQTT Bridge entry",
-          "description": "The ID of the loaded bridge entry configured for a finite refresh run."
+          "description": "The ID of the loaded bridge entry configured for durable or finite refresh runs."
         }
       }
     },

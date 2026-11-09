@@ -38,7 +38,7 @@ from .dreame import (
     DreameVacuumStreamStatus,
 )
 from .coordinator import DreameVacuumDataUpdateCoordinator
-from .local_bridge import LocalBridgeCoordinator, LocalBridgeEntity, is_local_bridge
+from .local_bridge import LocalBridgeCoordinator, LocalBridgeEntity, bridge_property_label, is_local_bridge
 from .entity import DreameVacuumEntity, DreameVacuumEntityDescription, remove_entities
 
 STREAM_STATUS_TO_ICON = {
@@ -674,11 +674,18 @@ async def async_setup_entry(
     """Set up Dreame Vacuum sensor based on a config entry."""
     coordinator = hass.data[DOMAIN][entry.entry_id]
     if is_local_bridge(entry.data):
-        entities = [LocalBridgeBattery(coordinator)]
+        entities = []
+        if not coordinator.durable_refresh_enabled:
+            entities.append(LocalBridgeBattery(coordinator))
         if coordinator.state_refresh_enabled or coordinator.state_refresh_run_enabled:
             entities.append(LocalBridgeStateRefresh(coordinator))
         if coordinator.state_refresh_run_enabled:
             entities.append(LocalBridgeStateRefreshRun(coordinator))
+        if coordinator.durable_refresh_enabled:
+            entities.extend(
+                LocalBridgePassiveProperty(coordinator, prop)
+                for prop in (DreameVacuumProperty.STATE, DreameVacuumProperty.STATUS)
+            )
         async_add_entities(entities)
         return
 
@@ -728,6 +735,38 @@ class LocalBridgeBattery(LocalBridgeEntity, SensorEntity):
     @property
     def available(self) -> bool:
         return super().available and self.native_value is not None
+
+
+class LocalBridgePassiveProperty(LocalBridgeEntity, SensorEntity):
+    """Keep passive state or status in its own recorder history."""
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, coordinator: LocalBridgeCoordinator, prop: DreameVacuumProperty) -> None:
+        self._property = prop
+        self._property_name = prop.name.lower()
+        self._attr_translation_key = f"local_passive_{self._property_name}"
+        super().__init__(coordinator, self._attr_translation_key)
+
+    @property
+    def _value(self) -> int | None:
+        return self.coordinator.device.data.get(self._property.value)
+
+    @property
+    def available(self) -> bool:
+        return super().available and self._value is not None
+
+    @property
+    def native_value(self) -> str | None:
+        if (value := self._value) is not None:
+            return bridge_property_label(self._property_name, value)
+        return None
+
+    @property
+    def extra_state_attributes(self) -> dict | None:
+        if (value := self._value) is not None:
+            return {"provenance": "passive", "value": value}
+        return None
 
 
 class LocalBridgeStateRefresh(LocalBridgeEntity, SensorEntity):

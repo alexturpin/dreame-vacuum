@@ -7,7 +7,7 @@ from typing import Final
 
 from .coordinator import DreameVacuumDataUpdateCoordinator
 from .entity import DreameVacuumEntity
-from .local_bridge import LocalBridgeCoordinator, LocalBridgeEntity, is_local_bridge
+from .local_bridge import LocalBridgeCoordinator, LocalBridgeEntity, bridge_state, is_local_bridge
 
 from dataclasses import dataclass
 from homeassistant.helpers.importlib import async_import_module
@@ -1639,7 +1639,7 @@ class DreameVacuum(DreameVacuumEntity, StateVacuumEntity):
 
 
 class LocalBridgeVacuum(LocalBridgeEntity, StateVacuumEntity):
-    """Represent a vacuum using only the state reported by the bridge."""
+    """Represent a read-only vacuum with an explicit source of activity."""
 
     _attr_name = None
     _attr_supported_features = VacuumEntityFeature(0)
@@ -1663,7 +1663,30 @@ class LocalBridgeVacuum(LocalBridgeEntity, StateVacuumEntity):
             return self._activity_class(activity)
         return activity
 
+    @property
+    def available(self) -> bool:
+        if self.coordinator.durable_refresh_enabled:
+            return self.coordinator.refresh_snapshot is not None
+        return super().available
+
+    @property
+    def extra_state_attributes(self) -> dict | None:
+        if self.coordinator.durable_refresh_enabled and (snapshot := self.coordinator.refresh_snapshot):
+            return {"provenance": snapshot["provenance"], "sample_window": snapshot["sample_window"].copy()}
+        return None
+
     def _reported_activity(self) -> str | None:
+        if self.coordinator.durable_refresh_enabled:
+            snapshot = self.coordinator.refresh_snapshot
+            if snapshot is None:
+                return None
+            properties = snapshot["properties"]
+            error = properties["error"]
+            if error["label"] is None:
+                return None
+            if error["value"] != 0:
+                return STATE_ERROR
+            return STATE_CODE_TO_STATE.get(bridge_state(properties["state"]["value"]))
         state = self.coordinator.device.status.state
         if state == DreameVacuumState.UNKNOWN:
             return None

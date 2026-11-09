@@ -2,14 +2,14 @@
 
 The experimental config entry uses the upstream `dreame_vacuum` domain and
 real Home Assistant entry, coordinator, vacuum, and sensor lifecycle. The
-device uses Tasshack's property IDs, property cache and battery status
-accessor. The local vacuum maps reported state using Tasshack's activity map.
+device uses Tasshack's property IDs, passive property cache and battery
+status accessor. The local vacuum maps state using Tasshack's activity map.
 
 The read-only mode deliberately creates no `DreameVacuumProtocol`. The
 upstream constructor and its startup path assume cloud or miIO discovery,
 followed by default property requests and recurring update timers. The local
-coordinator owns HTTP polling and applies a complete, validated snapshot to
-the shared device cache. Applying the snapshot avoids the upstream
+coordinator owns HTTP polling and applies validated passive GET results to
+the shared device cache. Applying those results avoids the upstream
 `_message_callback` and `_handle_properties` paths, whose property callbacks
 and timers assume a connected upstream transport. Local vacuum and sensor
 platform setup stop before legacy service registration or device probing.
@@ -20,14 +20,17 @@ The explicit administrator actions use the bridge client's singleton read.
 Upstream `_request_properties` batches results through the legacy update
 path. Each bridge action checks passive readiness, validates a correlated
 reply for the exact address, checks the session again, and returns the raw
-value to the caller. The passive cache is populated by snapshots. A local
-coordinator refuses overlapping reads while it awaits the snapshot or reply.
+value to the caller. A local coordinator refuses overlapping reads while it
+awaits the snapshot or reply.
 
 ## Read modes
 
-The Local MQTT Bridge configuration and reconfiguration form offers three modes
-under **Read mode**. **Legacy individual reads** is the default and preserves
-the battery action and the separate five-property trial actions. The battery
+**Passive telemetry only** is the default for Local MQTT Bridge, including
+existing entries without a saved **Read mode**. The vacuum and battery use
+passive reports and the entry refuses all read actions.
+
+**Legacy individual reads** preserves the battery action and the separate
+five-property trial actions for entries explicitly configured in that mode. The battery
 action uses its own one-shot bridge authorization. The legacy property trial
 requires one action per property, in order. It stores the bridge's continuation
 receipt in memory and loses it on reload. A read failure or loss of passive
@@ -95,6 +98,62 @@ reloads. It starts inactive after setup, and the grant capabilities stay in
 memory. Reload, shutdown, session change, invalid replies and timing
 failures end the active run. The integration does not recover a lost
 capability or start another run automatically.
+
+### Durable state refresh
+
+Select **Durable state refresh** with pinned HTTPS for a matching
+durable bridge owner. A loaded entry starts with passive polling and an
+unavailable vacuum. Each finite run takes three distinct steps.
+
+1. A direct authenticated administrator calls
+   `dreame_vacuum.prepare_local_state_refresh_run` with only
+   `config_entry_id` and response handling. It checks passive readiness and
+   returns the current `epoch`, random `run_id` and `revoke_commitment`.
+   The commitment is the lowercase SHA-256 digest of the ASCII revoke
+   secret. The secret stays in the running Home Assistant entry.
+2. An independent root operator authorizes the exact returned tuple on
+   the MQTT owner. Follow the owner's local procedure. HTTP and relay
+   credentials provide no arm operation. If a previous run spent a read in
+   the current epoch, wait at least 120 seconds from its last cycle start
+   before arming a new preparation.
+3. A direct authenticated administrator calls
+   `dreame_vacuum.start_local_state_refresh_run` with only
+   `config_entry_id`. The action consumes the preparation and claims the
+   owner grant using the in-memory proof. It uses the finite run's ordered
+   reads, pacing, budgets and version-2 endpoints. Its claim requires the
+   owner to accept and echo `mode: durable_refresh`.
+
+A preparation is usable for at most ten minutes and is discarded on
+detected readiness loss, epoch change, cancellation, unload or shutdown.
+A restarted entry has no preparation or grant proof. A failed or ambiguous
+start consumes the preparation. Use the progress sensor to inspect the
+result. Any later run needs a fresh preparation and independent owner
+authorization. Cancel via `dreame_vacuum.cancel_local_state_refresh_run`
+with the same entry ID. Cancellation clears local state and attempts one
+bounded abort, including for a preparation that the owner may already
+have armed. If the abort cannot reach the owner, its separate expiry
+still applies. The owner can also disarm locally. If cancellation and
+root arming race, verify the owner is disarmed before preparing again.
+
+The read-only vacuum is available only while the complete solicited
+snapshot is fresh. It exposes `provenance: solicited` and its
+`sample_window`. Recognized nonzero error codes take precedence.
+Unrecognized error codes produce unknown activity. With observed error
+zero, Tasshack maps the supported raw state codes, including the
+zero alias for charging completed. Unrecognized state codes also
+produce unknown activity. Status, charging status and task status
+remain observations in **Local state refresh**. They do not supply
+derived activity when the state or error is unknown.
+
+The snapshot clears 60 seconds after its first request and on detected
+disconnect, session replacement or cancellation. The vacuum becomes
+unavailable between snapshots. **Local passive state** and **Local passive
+status** keep separate history from the bridge's per-session report cache.
+That cache has no per-property timestamps. This mode creates no battery
+entity. An existing passive receiver can still display its last observed
+battery value for the current session. Battery freshness requires its own
+policy. This profile exposes zero control features and does not request
+battery, maps or writes.
 
 ## Upstream protocol seam
 

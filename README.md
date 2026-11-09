@@ -29,14 +29,14 @@ authorized trials. It has the same Home Assistant domain as the upstream
 integration, so evaluate it from a pinned checkout in a dedicated test instance.
 See the [implementation boundary](docs/LOCAL_BRIDGE.md) for the device paths.
 
-Local MQTT Bridge creates a vacuum with zero control features and a battery
-sensor. The vacuum uses supported state codes from passive reports. The
-battery sensor displays the reported percentage, including zero. The bridge
-must supply fresh telemetry for the active session before the vacuum is
-available. The battery needs its own report. On connection loss or invalid
-state, the client clears its cache. If connectivity returns in the same epoch,
-the client needs an advancing sequence before restoring availability. A new
-epoch starts with an empty cache.
+Local MQTT Bridge creates a vacuum with zero control features. The vacuum
+uses supported state codes from passive reports in the default mode, or a
+complete fresh snapshot in durable refresh mode. The default mode also
+shows passive battery percentages, including zero. On connection loss or
+invalid state, the client clears its cache. If
+connectivity returns in the same epoch, the client needs an advancing
+sequence before restoring passive availability. A new epoch starts with an
+empty cache.
 
 ### Configuration
 
@@ -47,16 +47,16 @@ token. Use HTTPS on an RFC 1918 IPv4 or ULA IPv6 address. The HA system trust
 store can verify the certificate and address, or you can enter the SHA-256
 fingerprint of the exact server certificate, obtained over a trusted channel.
 HTTP is available for loopback testing. Use **Reconfigure** on the entry to
-change these settings. **Read mode** defaults to legacy individual reads;
-choose **Bounded state refresh** only for a matching, separately authorized
-`state_refresh` owner grant. The bearer token is excluded from diagnostics.
+change these settings. **Read mode** defaults to **Passive telemetry only**.
+Select an explicit read mode for a matching bridge owner and separately
+authorized run. The bearer token is excluded from diagnostics.
 
 Local setup validates the bridge with a GET. Setup, reconfiguration, and the
 10-second refresh cycle fetch passive snapshots only. The local entry creates
 no Dreame cloud, miIO, or map manager and exposes no action, map, or setting
 controls. Other entry types retain their existing transport and entities.
 
-The administrator action `dreame_vacuum.read_local_battery` takes a loaded
+In **Legacy individual reads** mode, `dreame_vacuum.read_local_battery` takes a loaded
 local `config_entry_id` and requires response handling. Invoke it only when a
 single robot request has been separately authorized. The action checks current
 readiness, requests one battery reading, and verifies that the session is
@@ -105,6 +105,16 @@ subsequent cycles run 125 seconds apart after validation. The progress
 sensor and fresh solicited snapshot are separate diagnostics. See
 [read modes and freshness](docs/LOCAL_BRIDGE.md#read-modes) for the pinned
 HTTPS requirement, start and cancel actions, and run limits.
+
+### Durable state refresh
+
+A pinned HTTPS entry in **Durable state refresh** mode starts unarmed. A
+direct administrator prepares a run, a local root operator authorizes that
+exact preparation at the owner, and the administrator then starts it. The
+vacuum entity shows activity only while a complete same-session solicited
+snapshot is fresh. Separate diagnostics retain passive state and status.
+Battery remains with the existing passive receiver. See the
+[durable mode procedure](docs/LOCAL_BRIDGE.md#durable-state-refresh).
 
 ### Bridge contract
 
