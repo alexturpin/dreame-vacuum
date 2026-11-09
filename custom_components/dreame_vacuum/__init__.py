@@ -35,6 +35,7 @@ from .coordinator import DreameVacuumDataUpdateCoordinator
 from .local_bridge import (
     SERVICE_READ_LOCAL_BATTERY,
     SERVICE_READ_LOCAL_PROPERTY,
+    SERVICE_REFRESH_LOCAL_STATE,
     LocalBridgeCoordinator,
     async_register_local_read,
     is_local_bridge,
@@ -101,13 +102,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload Dreame Vacuum config entry."""
     if is_local_bridge(entry.data):
+        coordinators = hass.data[DOMAIN]
+        coordinator: LocalBridgeCoordinator = coordinators[entry.entry_id]
+        coordinator.async_cancel_refresh()
         if not await hass.config_entries.async_unload_platforms(entry, LOCAL_BRIDGE_PLATFORMS):
             return False
-        coordinators = hass.data[DOMAIN]
-        coordinator = coordinators.pop(entry.entry_id)
+        coordinators.pop(entry.entry_id)
         if not any(isinstance(item, LocalBridgeCoordinator) for item in coordinators.values()):
             hass.services.async_remove(DOMAIN, SERVICE_READ_LOCAL_BATTERY)
             hass.services.async_remove(DOMAIN, SERVICE_READ_LOCAL_PROPERTY)
+            hass.services.async_remove(DOMAIN, SERVICE_REFRESH_LOCAL_STATE)
         await coordinator.async_close()
         return True
 

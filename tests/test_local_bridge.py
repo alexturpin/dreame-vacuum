@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from asyncio import Event, wait_for
+from asyncio import CancelledError, Event, get_running_loop, sleep, wait_for
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta
 import json
 import socket
 from unittest.mock import patch
@@ -20,10 +20,12 @@ from homeassistant.core import Context
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.exceptions import HomeAssistantError, Unauthorized
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import async_fire_time_changed
 
 from custom_components.dreame_vacuum.const import CONF_TYPE, DOMAIN
+from custom_components.dreame_vacuum import local_bridge
 from custom_components.dreame_vacuum.diagnostics import async_get_config_entry_diagnostics
 from custom_components.dreame_vacuum.dreame import (
     DreameVacuumAction,
@@ -32,12 +34,16 @@ from custom_components.dreame_vacuum.dreame import (
 )
 from custom_components.dreame_vacuum.local_bridge import (
     ACCOUNT_TYPE_LOCAL_BRIDGE,
+    CONF_BRIDGE_READ_MODE,
     CONF_BRIDGE_TOKEN,
     CONF_BRIDGE_URL,
     CONF_ENTRY_ID,
     CONF_PROPERTY,
+    READ_MODE_LEGACY,
+    READ_MODE_STATE_REFRESH,
     SERVICE_READ_LOCAL_BATTERY,
     SERVICE_READ_LOCAL_PROPERTY,
+    SERVICE_REFRESH_LOCAL_STATE,
     LocalBridgeError,
     validate_bridge_url,
 )
@@ -47,6 +53,14 @@ _EPOCH = "a" * 32
 _NEW_EPOCH = "b" * 32
 _VACUUM = "vacuum.bridge_test"
 _BATTERY = "sensor.bridge_test_battery_level"
+_REFRESH_SENSOR = "sensor.bridge_test_local_state_refresh"
+_REFRESH_ADDRESSES = (
+    ("0", 2, 1),
+    ("5", 4, 1),
+    ("3", 3, 2),
+    ("11", 4, 7),
+    ("1", 2, 2),
+)
 
 pytestmark = [pytest.mark.usefixtures("enable_custom_integrations"), pytest.mark.asyncio]
 
@@ -78,11 +92,14 @@ class FakeBridge:
     status: int = 200
     raw_state: str | None = None
     read_reply: dict = field(default_factory=dict)
+    read_replies: list[dict] = field(default_factory=list)
     read_error: str | None = None
     read_status: int = 200
     read_started: Event = field(default_factory=Event)
     read_release: Event | None = None
+    hold_read_at: int = 1
     read_state: dict | None = None
+    request_times: list[float] = field(default_factory=list)
 
     async def get_state(self, request):
         if request.headers.get("Authorization") != f"Bearer {self.token}":
@@ -97,9 +114,12 @@ class FakeBridge:
             raise web.HTTPUnauthorized()
         payload = await request.json()
         self.posts.append(payload)
-        self.read_started.set()
-        if self.read_release is not None:
-            await self.read_release.wait()
+        self.request_times.append(get_running_loop().time())
+        index = len(self.posts) - 1
+        if index + 1 == self.hold_read_at:
+            self.read_started.set()
+            if self.read_release is not None:
+                await self.read_release.wait()
         if self.read_state is not None:
             self.state = self.read_state
         reply = {
@@ -111,6 +131,8 @@ class FakeBridge:
         if self.read_error is not None:
             del reply["result"]
             reply["error"] = self.read_error
+        if index < len(self.read_replies):
+            reply.update(self.read_replies[index])
         return web.json_response(reply | self.read_reply, status=self.read_status)
 
 
@@ -163,8 +185,8 @@ async def _configure(hass, bridge, flow_id, **changes):
     )
 
 
-async def _load_entry(hass, bridge):
-    result = await _configure(hass, bridge, await _start_flow(hass))
+async def _load_entry(hass, bridge, **changes):
+    result = await _configure(hass, bridge, await _start_flow(hass), **changes)
     assert result["type"] is FlowResultType.CREATE_ENTRY
     entry = result["result"]
     await hass.async_block_till_done()
@@ -186,6 +208,309 @@ async def _read_trial(hass, entry, user, property_name, *, response=True):
         return_response=response,
         context=Context(user_id=user.id),
     )
+
+
+async def _refresh_trial(hass, entry, user, *, response=True, **fields):
+    return await hass.services.async_call(
+        DOMAIN,
+        SERVICE_REFRESH_LOCAL_STATE,
+        {CONF_ENTRY_ID: entry.entry_id} | fields,
+        blocking=True,
+        return_response=response,
+        context=Context(user_id=user.id),
+    )
+
+
+def _prepare_refresh(bridge, values=(2, 14, 2, 0, 0)):
+    bridge.state = _state(_property("0", 2, 3), _property("2", 3, 42), sequence=1)
+    bridge.read_replies = [
+        {
+            "result": [_property(did, siid, value, piid=piid)],
+            "continuation": f"{index + 1:032x}" if index < 4 else None,
+        }
+        for index, ((did, siid, piid), value) in enumerate(
+            zip(_REFRESH_ADDRESSES, values, strict=True)
+        )
+    ]
+
+
+async def _load_refresh_entry(hass, bridge):
+    return await _load_entry(hass, bridge, **{CONF_BRIDGE_READ_MODE: READ_MODE_STATE_REFRESH})
+
+
+def _assert_no_refresh(hass):
+    state = hass.states.get(_REFRESH_SENSOR)
+    assert state.state == STATE_UNAVAILABLE
+    assert {"provenance", "properties", "sample_window"}.isdisjoint(state.attributes)
+
+
+async def test_refresh_mode_is_explicit_per_entry(hass, bridge_factory, hass_admin_user):
+    legacy_bridge, refresh_bridge = await bridge_factory(), await bridge_factory()
+    legacy_entry, _ = await _load_entry(hass, legacy_bridge)
+    assert legacy_entry.data[CONF_BRIDGE_READ_MODE] == READ_MODE_LEGACY
+    refresh_entry, _ = await _load_refresh_entry(hass, refresh_bridge)
+    assert refresh_entry.data[CONF_BRIDGE_READ_MODE] == READ_MODE_STATE_REFRESH
+    with pytest.raises(HomeAssistantError, match="requires the state refresh bridge mode"):
+        await _refresh_trial(hass, legacy_entry, hass_admin_user)
+    with pytest.raises(HomeAssistantError, match="require the legacy local bridge mode"):
+        await _read_trial(hass, refresh_entry, hass_admin_user, "state")
+    with pytest.raises(HomeAssistantError, match="require the legacy local bridge mode"):
+        await hass.services.async_call(
+            DOMAIN,
+            SERVICE_READ_LOCAL_BATTERY,
+            {CONF_ENTRY_ID: refresh_entry.entry_id},
+            blocking=True,
+            return_response=True,
+            context=Context(user_id=hass_admin_user.id),
+        )
+    assert legacy_bridge.gets == refresh_bridge.gets == 2
+    assert legacy_bridge.posts == refresh_bridge.posts == []
+    assert await hass.config_entries.async_unload(refresh_entry.entry_id)
+    assert hass.services.has_service(DOMAIN, SERVICE_REFRESH_LOCAL_STATE)
+    assert await hass.config_entries.async_unload(legacy_entry.entry_id)
+    assert not hass.services.has_service(DOMAIN, SERVICE_REFRESH_LOCAL_STATE)
+
+
+async def test_each_refresh_entry_gets_one_attempt(hass, bridge_factory, hass_admin_user):
+    first_bridge, second_bridge = await bridge_factory(), await bridge_factory()
+    first, _ = await _load_refresh_entry(hass, first_bridge)
+    _prepare_refresh(second_bridge)
+    second, _ = await _load_refresh_entry(hass, second_bridge)
+    with pytest.raises(HomeAssistantError, match="no fresh telemetry"):
+        await _refresh_trial(hass, first, hass_admin_user)
+    assert not first_bridge.posts
+    assert (await _refresh_trial(hass, second, hass_admin_user))["provenance"] == "solicited"
+    assert len(second_bridge.posts) == 5
+
+
+async def test_preexisting_entry_without_a_mode_still_allows_legacy_read(
+    hass, bridge, hass_admin_user
+):
+    _prepare_refresh(bridge)
+    bridge.read_replies.clear()
+    entry, _ = await _load_entry(hass, bridge)
+    data = dict(entry.data)
+    del data[CONF_BRIDGE_READ_MODE]
+    hass.config_entries.async_update_entry(entry, data=data)
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    assert await hass.services.async_call(
+        DOMAIN,
+        SERVICE_READ_LOCAL_BATTERY,
+        {CONF_ENTRY_ID: entry.entry_id},
+        blocking=True,
+        return_response=True,
+        context=Context(user_id=hass_admin_user.id),
+    ) == {"battery_level": 67}
+    assert "continuation" not in bridge.posts[0]
+
+
+async def test_refresh_service_authorization(hass, bridge, hass_admin_user, hass_read_only_user):
+    _prepare_refresh(bridge)
+    entry, _ = await _load_refresh_entry(hass, bridge)
+    with pytest.raises(Unauthorized):
+        await _refresh_trial(hass, entry, hass_read_only_user)
+    with pytest.raises(HomeAssistantError):
+        await _refresh_trial(hass, entry, hass_admin_user, response=False)
+    with pytest.raises(Invalid):
+        await _refresh_trial(hass, entry, hass_admin_user, property="state")
+    assert bridge.gets == 2
+    assert not bridge.posts
+
+
+@pytest.mark.parametrize(
+    ("values", "labels"),
+    [
+        ((2, 14, 2, 0, 0), ("idle", "sleeping", "not_charging", "completed", "no_error")),
+        ((0, 14, 2, 0, 0), ("charging_completed", "sleeping", "not_charging", "completed", "no_error")),
+        ((19, -(1 << 31), -1, 65536, (1 << 31) - 1), (None, None, None, None, None)),
+    ],
+)
+async def test_refresh_publishes_only_a_complete_solicited_snapshot(
+    hass, bridge, hass_admin_user, values, labels
+):
+    _prepare_refresh(bridge, values)
+    entry, coordinator = await _load_refresh_entry(hass, bridge)
+    _assert_no_refresh(hass)
+    entity = er.async_get(hass).async_get(_REFRESH_SENSOR)
+    assert entity.entity_category is er.EntityCategory.DIAGNOSTIC
+    assert hass.states.get(_VACUUM).state == "paused"
+    assert hass.states.get(_VACUUM).attributes["supported_features"] == 0
+
+    result = await _refresh_trial(hass, entry, hass_admin_user)
+    assert bridge.gets == 4
+    assert len(bridge.posts) == 5
+    assert len({post["request_id"] for post in bridge.posts}) == 5
+    for index, (post, (did, siid, piid)) in enumerate(zip(bridge.posts, _REFRESH_ADDRESSES, strict=True)):
+        assert post["epoch"] == _EPOCH
+        assert post["method"] == "get_properties"
+        assert post["timeout"] == 5
+        assert post["params"] == [{"did": did, "siid": siid, "piid": piid}]
+        assert post["continuation"] == (f"{index:032x}" if index else None)
+    assert result["provenance"] == "solicited"
+    names = ("state", "status", "charging_status", "task_status", "error")
+    assert tuple(result["properties"]) == names
+    previous_response = None
+    previous_age = float("inf")
+    for name, value, label in zip(names, values, labels, strict=True):
+        sample = result["properties"][name]
+        assert (sample["value"], sample["label"]) == (value, label)
+        started = datetime.fromisoformat(sample["requested_at"])
+        ended = datetime.fromisoformat(sample["responded_at"])
+        assert started.utcoffset() == ended.utcoffset() == timedelta(0)
+        assert (previous_response or started) <= started <= ended
+        previous_response = ended
+        assert 0 <= sample["age_at_publication_seconds"] <= previous_age
+        previous_age = sample["age_at_publication_seconds"]
+    assert result["sample_window"] == {
+        "start": result["properties"]["state"]["requested_at"],
+        "end": result["properties"]["error"]["responded_at"],
+    }
+    sensor = hass.states.get(_REFRESH_SENSOR)
+    assert sensor.state == (labels[0] or STATE_UNKNOWN)
+    assert {key: sensor.attributes[key] for key in result} == result
+    assert hass.states.get(_VACUUM).state == "paused"
+    assert hass.states.get(_BATTERY).state == "42"
+    result["properties"]["state"]["value"] = 999
+    assert coordinator.refresh_snapshot["properties"]["state"]["value"] == values[0]
+    with pytest.raises(HomeAssistantError, match="already been used"):
+        await _refresh_trial(hass, entry, hass_admin_user)
+    assert bridge.gets == 4
+    assert len(bridge.posts) == 5
+
+
+@pytest.mark.parametrize(
+    ("step", "reply", "message"),
+    [
+        (2, {"result": []}, "Invalid bridge property response"),
+        (3, {"continuation": "malformed"}, "Invalid bridge continuation receipt"),
+        (3, {"continuation": "0" * 31 + "1"}, "reused a continuation receipt"),
+        (4, {"result": [_property("11", 4, 1 << 31, piid=7)]}, "Invalid bridge property response"),
+        (5, {"continuation": "f" * 32}, "Invalid final bridge continuation receipt"),
+        (5, {"request_id": "f" * 32}, "did not match the request"),
+    ],
+)
+async def test_invalid_refresh_response_stops_the_cycle(hass, bridge, hass_admin_user, step, reply, message):
+    _prepare_refresh(bridge)
+    bridge.read_replies[step - 1].update(reply)
+    entry, _ = await _load_refresh_entry(hass, bridge)
+    with pytest.raises(HomeAssistantError, match=message):
+        await _refresh_trial(hass, entry, hass_admin_user)
+    _assert_no_refresh(hass)
+    assert bridge.gets == 3
+    assert len(bridge.posts) == step
+    with pytest.raises(HomeAssistantError, match="already been used"):
+        await _refresh_trial(hass, entry, hass_admin_user)
+    assert len(bridge.posts) == step
+
+
+@pytest.mark.parametrize("replacement", [True, False])
+async def test_refresh_discards_reads_after_final_epoch_or_readiness_loss(
+    hass, bridge, hass_admin_user, replacement
+):
+    _prepare_refresh(bridge)
+    entry, _ = await _load_refresh_entry(hass, bridge)
+    bridge.read_state = (
+        _state(_property("0", 2, 2), epoch=_NEW_EPOCH, sequence=1)
+        if replacement else _state(epoch=None)
+    )
+    with pytest.raises(HomeAssistantError, match="session changed"):
+        await _refresh_trial(hass, entry, hass_admin_user)
+    _assert_no_refresh(hass)
+    assert bridge.gets == 4
+    assert len(bridge.posts) == 5
+
+
+async def test_failed_preflight_consumes_the_entry_attempt(hass, bridge, hass_admin_user):
+    entry, coordinator = await _load_refresh_entry(hass, bridge)
+    with pytest.raises(HomeAssistantError, match="no fresh telemetry"):
+        await _refresh_trial(hass, entry, hass_admin_user)
+    _prepare_refresh(bridge)
+    await _refresh(hass, coordinator)
+    with pytest.raises(HomeAssistantError, match="already been used"):
+        await _refresh_trial(hass, entry, hass_admin_user)
+    _assert_no_refresh(hass)
+    assert bridge.gets == 4
+    assert not bridge.posts
+
+
+@pytest.mark.parametrize("stop", ["cancel", "unload", "deadline"])
+async def test_inflight_refresh_ends_without_a_followup(
+    hass, bridge, hass_admin_user, monkeypatch, stop
+):
+    _prepare_refresh(bridge)
+    entry, coordinator = await _load_refresh_entry(hass, bridge)
+    bridge.hold_read_at = 2
+    bridge.read_release = Event()
+    if stop == "deadline":
+        monkeypatch.setattr(local_bridge, "_REFRESH_TIMEOUT", 0.2)
+    pending = hass.async_create_task(_refresh_trial(hass, entry, hass_admin_user))
+    try:
+        await wait_for(bridge.read_started.wait(), timeout=2)
+        _assert_no_refresh(hass)
+        with pytest.raises(HomeAssistantError, match="busy"):
+            await _refresh_trial(hass, entry, hass_admin_user)
+        await coordinator.async_refresh()
+        assert bridge.gets == 3
+        if stop == "unload":
+            assert await wait_for(hass.config_entries.async_unload(entry.entry_id), timeout=2)
+        elif stop == "cancel":
+            pending.cancel()
+        if stop == "deadline":
+            with pytest.raises(HomeAssistantError, match="refresh timed out"):
+                await wait_for(pending, timeout=2)
+        else:
+            with pytest.raises(CancelledError):
+                await wait_for(pending, timeout=2)
+    finally:
+        bridge.read_release.set()
+    assert len(bridge.posts) == 2
+    assert bridge.gets == 3
+    if stop == "unload":
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+    _assert_no_refresh(hass)
+    with pytest.raises(HomeAssistantError, match="already been used"):
+        await _refresh_trial(hass, entry, hass_admin_user)
+    assert len(bridge.posts) == 2
+
+
+@pytest.mark.parametrize("invalidate", ["expiry", "disconnect", "epoch", "malformed", "reload"])
+async def test_refresh_lifetime_does_not_follow_passive_telemetry(
+    hass, bridge, hass_admin_user, monkeypatch, invalidate
+):
+    _prepare_refresh(bridge)
+    if invalidate == "expiry":
+        monkeypatch.setattr(local_bridge, "_REFRESH_TTL", 0.25)
+    entry, coordinator = await _load_refresh_entry(hass, bridge)
+    before = hass.loop.time()
+    await _refresh_trial(hass, entry, hass_admin_user)
+    expiry = coordinator._refresh_expiry
+    assert expiry is not None
+    assert before <= expiry.when() - local_bridge._REFRESH_TTL <= bridge.request_times[0]
+    assert hass.states.get(_REFRESH_SENSOR).state == "idle"
+    if invalidate == "reload":
+        assert await hass.config_entries.async_reload(entry.entry_id)
+        await hass.async_block_till_done()
+        assert expiry.cancelled()
+    else:
+        bridge.state = _state(_property("0", 2, 2), sequence=2)
+        if invalidate == "disconnect":
+            bridge.state = _state(epoch=None)
+        elif invalidate == "epoch":
+            bridge.state = _state(_property("0", 2, 2), epoch=_NEW_EPOCH, sequence=1)
+        elif invalidate == "malformed":
+            bridge.raw_state = "{"
+        await _refresh(hass, coordinator)
+        if invalidate == "expiry":
+            assert coordinator._refresh_expiry is expiry
+            assert hass.states.get(_REFRESH_SENSOR).state == "idle"
+            await sleep(max(0, expiry.when() - hass.loop.time()) + 0.01)
+            assert hass.states.get(_VACUUM).state == "idle"
+            assert bridge.gets == 5
+        else:
+            assert expiry.cancelled()
+    _assert_no_refresh(hass)
+    assert len(bridge.posts) == 5
 
 
 async def test_loopback_fixture_blocks_external_sockets_and_ignores_env_proxy(hass, bridge, monkeypatch):
@@ -629,8 +954,9 @@ async def test_passive_poll_loss_seals_in_progress_trial(hass, bridge, hass_admi
     assert len(bridge.posts) == 1
 
 
-async def test_reconfigure_reloads_and_never_publishes(hass, bridge):
-    entry, previous = await _load_entry(hass, bridge)
+@pytest.mark.parametrize("mode", [READ_MODE_LEGACY, READ_MODE_STATE_REFRESH])
+async def test_reconfigure_reloads_and_never_publishes(hass, bridge, mode):
+    entry, previous = await _load_entry(hass, bridge, **{CONF_BRIDGE_READ_MODE: mode})
     result = await hass.config_entries.flow.async_init(
         DOMAIN, context={"source": SOURCE_RECONFIGURE, "entry_id": entry.entry_id}
     )
@@ -642,6 +968,7 @@ async def test_reconfigure_reloads_and_never_publishes(hass, bridge):
     await hass.async_block_till_done()
     assert entry.state is ConfigEntryState.LOADED
     assert entry.data[CONF_BRIDGE_TOKEN] == bridge.token
+    assert entry.data[CONF_BRIDGE_READ_MODE] == mode
     assert hass.data[DOMAIN][entry.entry_id] is not previous
     assert not bridge.posts
 

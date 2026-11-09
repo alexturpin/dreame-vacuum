@@ -57,11 +57,14 @@ from .const import (
 
 from .local_bridge import (
     ACCOUNT_TYPE_LOCAL_BRIDGE,
+    BRIDGE_READ_MODES,
     CONF_BRIDGE_FINGERPRINT,
+    CONF_BRIDGE_READ_MODE,
     CONF_BRIDGE_TOKEN,
     CONF_BRIDGE_URL,
     LocalBridgeClient,
     LocalBridgeError,
+    READ_MODE_LEGACY,
     is_local_bridge,
     validate_bridge_url,
 )
@@ -398,6 +401,8 @@ class DreameVacuumFlowHandler(ConfigFlow, domain=DOMAIN):
     async def async_step_local_bridge(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         """Configure a bridge without connecting to the robot or a cloud account."""
         errors = {}
+        defaults = self.entry.data if self.entry is not None else {}
+        read_mode = defaults.get(CONF_BRIDGE_READ_MODE, READ_MODE_LEGACY)
         if user_input is not None:
             name = user_input[CONF_NAME].strip()
             try:
@@ -407,6 +412,9 @@ class DreameVacuumFlowHandler(ConfigFlow, domain=DOMAIN):
                     CONF_BRIDGE_URL: str(validate_bridge_url(user_input[CONF_BRIDGE_URL])),
                     CONF_BRIDGE_TOKEN: user_input[CONF_BRIDGE_TOKEN].strip(),
                     CONF_BRIDGE_FINGERPRINT: user_input.get(CONF_BRIDGE_FINGERPRINT, "").strip(),
+                    CONF_BRIDGE_READ_MODE: vol.In(BRIDGE_READ_MODES)(
+                        user_input.get(CONF_BRIDGE_READ_MODE, read_mode)
+                    ),
                 }
                 bridge = LocalBridgeClient(async_get_clientsession(self.hass), data)
             except (ValueError, vol.Invalid):
@@ -428,7 +436,6 @@ class DreameVacuumFlowHandler(ConfigFlow, domain=DOMAIN):
                     self._abort_if_unique_id_configured()
                     return self.async_create_entry(title=name, data=data)
 
-        defaults = self.entry.data if self.entry is not None else {}
         return self.async_show_form(
             step_id="local_bridge",
             data_schema=vol.Schema(
@@ -441,6 +448,14 @@ class DreameVacuumFlowHandler(ConfigFlow, domain=DOMAIN):
                     vol.Optional(
                         CONF_BRIDGE_FINGERPRINT, default=defaults.get(CONF_BRIDGE_FINGERPRINT, "")
                     ): str,
+                    vol.Optional(
+                        CONF_BRIDGE_READ_MODE,
+                        default=read_mode,
+                    ): SelectSelector(
+                        SelectSelectorConfig(
+                            options=list(BRIDGE_READ_MODES), translation_key=CONF_BRIDGE_READ_MODE
+                        )
+                    ),
                 }
             ),
             errors=errors,

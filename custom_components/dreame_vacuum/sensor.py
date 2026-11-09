@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -13,6 +14,7 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import STATE_UNKNOWN
 from homeassistant.helpers.icon import icon_for_battery_level
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import EntityCategory
@@ -672,7 +674,10 @@ async def async_setup_entry(
     """Set up Dreame Vacuum sensor based on a config entry."""
     coordinator = hass.data[DOMAIN][entry.entry_id]
     if is_local_bridge(entry.data):
-        async_add_entities([LocalBridgeBattery(coordinator)])
+        entities = [LocalBridgeBattery(coordinator)]
+        if coordinator.state_refresh_enabled:
+            entities.append(LocalBridgeStateRefresh(coordinator))
+        async_add_entities(entities)
         return
 
     remove_entities(hass, entry, coordinator, "sensor", SENSORS)
@@ -721,3 +726,27 @@ class LocalBridgeBattery(LocalBridgeEntity, SensorEntity):
     @property
     def available(self) -> bool:
         return super().available and self.native_value is not None
+
+
+class LocalBridgeStateRefresh(LocalBridgeEntity, SensorEntity):
+    """Expose only a complete, currently fresh solicited snapshot."""
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_translation_key = "local_state_refresh"
+
+    def __init__(self, coordinator: LocalBridgeCoordinator) -> None:
+        super().__init__(coordinator, "local_state_refresh")
+
+    @property
+    def available(self) -> bool:
+        return self.coordinator.refresh_snapshot is not None
+
+    @property
+    def native_value(self) -> str | None:
+        if snapshot := self.coordinator.refresh_snapshot:
+            return snapshot["properties"]["state"]["label"] or STATE_UNKNOWN
+        return None
+
+    @property
+    def extra_state_attributes(self) -> dict | None:
+        return deepcopy(self.coordinator.refresh_snapshot)

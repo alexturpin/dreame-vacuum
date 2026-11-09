@@ -47,7 +47,9 @@ token. Use HTTPS on an RFC 1918 IPv4 or ULA IPv6 address. The HA system trust
 store can verify the certificate and address, or you can enter the SHA-256
 fingerprint of the exact server certificate, obtained over a trusted channel.
 HTTP is available for loopback testing. Use **Reconfigure** on the entry to
-change these settings. The bearer token is excluded from diagnostics.
+change these settings. **Read mode** defaults to legacy individual reads;
+choose **Bounded state refresh** only for a matching, separately authorized
+`state_refresh` owner grant. The bearer token is excluded from diagnostics.
 
 Local setup validates the bridge with a GET. Setup, reconfiguration, and the
 10-second refresh cycle fetch passive snapshots only. The local entry creates
@@ -78,6 +80,23 @@ and diagnostics continue to reflect passive reports.
 | `task_status` | `"11"` | 4 | 7 |
 | `error` | `"1"` | 2 | 2 |
 
+### Bounded state refresh
+
+In bounded-refresh mode, the administrator action
+`dreame_vacuum.refresh_local_state` takes only `config_entry_id` and requires
+response handling. It attempts the five table rows in one ordered cycle, with
+an overall 45-second limit and no retries. The entry refuses the individual
+read actions and permits one refresh attempt per Home Assistant process,
+including across entry reloads.
+
+Only a complete same-session cycle publishes a separate diagnostic sensor.
+It exposes the raw values, literal labels, sample times and solicited origin;
+it expires 60 seconds after the first property request began. Passive sensors
+keep their own report history. Setup, reconnect and expiry do not initiate
+robot reads. See [read modes and freshness](docs/LOCAL_BRIDGE.md#read-modes)
+for the result schema and failure behavior. This mode adds no periodic robot
+polling or vacuum controls.
+
 ### Bridge contract
 
 Both endpoints require the configured bearer token. The client disables
@@ -104,7 +123,9 @@ redirects and environment proxies.
   the first request and contains the previous successful reply's receipt
   thereafter. Each successful trial reply carries the next receipt as 32
   lowercase hexadecimal characters, or null for the fifth and final reply.
-  The client retains a receipt only after confirming the active epoch again.
+  Legacy individual reads confirm the epoch after every read. The bounded
+  refresh checks it before and after the complete cycle, while the owner
+  validates the active session on every read.
   The battery action uses the original request and reply fields. An error
   reply carries `version`, `request_id`, `epoch`, and `error`. A refusal or
   transport or protocol failure ends the trial for that client and epoch.

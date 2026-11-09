@@ -24,6 +24,14 @@ read_local_property:
             - task_status
             - error
 
+refresh_local_state:
+  fields:
+    config_entry_id:
+      required: true
+      selector:
+        config_entry:
+          integration: dreame_vacuum
+
 vacuum_clean_segment:
   target:
     entity:
