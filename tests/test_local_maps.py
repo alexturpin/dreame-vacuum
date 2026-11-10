@@ -505,3 +505,34 @@ async def test_relocation_without_rendered_map_stays_unavailable(hass, candidate
     assert camera.state == STATE_UNAVAILABLE
     assert camera.extra_state_attributes["map_stale"] is False
     assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+@pytest.mark.parametrize("failure", [None, "rejected"])
+async def test_native_furniture_service_sends_v1_payload_and_restores_on_failure(hass, candidate_bridge, failure):
+    from copy import deepcopy
+    from homeassistant.exceptions import HomeAssistantError
+
+    candidate_bridge.sequence = 1
+    candidate_bridge.map_reports = [{"sequence": 1, "properties": [{"did": "76", "siid": 6, "piid": 1, "code": 0, "value": frame(extra={
+        "ai_furniture_user": [[100, 200, 1, 0, 0, 100, 200, 200, 0, 1.0]],
+    })}]}]
+    entry, coordinator = await _load_entry(hass, candidate_bridge, bridge_read_mode="local_candidate")
+    manager = coordinator.device._map_manager
+    manager._selected_map_id = manager._map_data.map_id
+    original = deepcopy(manager._map_data.furnitures)
+    candidate_bridge.rpc_error = failure
+    data = {"entity_id": _VACUUM, "furnitures": [[0, 1, 0, 200, 200, 300, 400, 90, 1.0, 0, 1]]}
+    if failure:
+        with pytest.raises(HomeAssistantError):
+            await hass.services.async_call(DOMAIN, "vacuum_set_furniture", data, blocking=True)
+        assert manager._map_data.furnitures == original
+    else:
+        await hass.services.async_call(DOMAIN, "vacuum_set_furniture", data, blocking=True)
+    edits = [p['params'] for p in candidate_bridge.posts if p['method'] == 'action' and p['params']['aiid'] == 2]
+    assert len(edits) == 1
+    assert edits[0]['siid'] == 6
+    assert json.loads(edits[0]['in'][0]['value']) == {
+        'mapfurniture': [[300, 400, 1, 0, 200, 300, 200, 200, 90, 1.0]], 'mfet': [1],
+    }
+    assert await hass.config_entries.async_unload(entry.entry_id)

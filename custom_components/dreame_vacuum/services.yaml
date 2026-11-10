@@ -592,3 +592,26 @@ vacuum_set_dnd_tasks:
       required: true
       selector:
         object:
+
+
+vacuum_set_furniture:
+  name: Set map furniture
+  description: >-
+    Replace the complete furniture list on the current saved map. Include all
+    furniture to retain. This edits map annotations; it does not move the robot.
+    Supported local D10s Pro maps use furniture format version 1.
+  target:
+    entity:
+      integration: dreame_vacuum
+      domain: vacuum
+  fields:
+    furnitures:
+      name: Complete furniture list
+      description: >-
+        List of rows: [id, type, room_id, width, height, center_x, center_y,
+        angle, scale, edit_type, modified]. Coordinates and dimensions use
+        robot map units. Version 1 ignores id and room_id; modified is 0 or 1.
+        An empty list removes all furniture annotations.
+      required: true
+      selector:
+        object:

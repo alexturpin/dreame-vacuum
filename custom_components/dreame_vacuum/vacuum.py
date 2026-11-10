@@ -161,7 +161,7 @@ _CANDIDATE_SERVICES = {
     "vacuum_restore_map", "vacuum_merge_segments", "vacuum_split_segments",
     "vacuum_rename_segment", "vacuum_set_cleaning_sequence", "vacuum_set_custom_cleaning",
     "vacuum_set_segment_type", "vacuum_set_floor_material", "vacuum_set_walls",
-    "vacuum_set_obstacle_ignore", "vacuum_reset_consumable",
+    "vacuum_set_obstacle_ignore", "vacuum_reset_consumable", "vacuum_set_furniture",
     "vacuum_set_schedule", "vacuum_set_dnd_tasks", "vacuum_delete_scheduled_task", "vacuum_delete_dnd_task",
 }
 
@@ -784,7 +784,7 @@ async def async_setup_entry(
     register_entity_service(
         "vacuum_set_furniture",
         {
-            vol.Optional("furnitures"): vol.All(
+            vol.Required("furnitures"): vol.All(
                 list,
                 [
                     vol.ExactSequence(
