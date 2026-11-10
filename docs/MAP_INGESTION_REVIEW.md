@@ -72,3 +72,17 @@ map, checks repeated-frame deduplication and applies out-of-order P frames.
 All 15 map tests and 7 candidate diagnostics tests passed under the offline
 guard. A privately retained real response also decoded and rendered through
 the manager offline; its map bytes and image are not part of the repository.
+
+## Cached uptime replay follow-up — local.12
+
+Replaying cached frames spanning hours can project later frames into the future
+when the first old frame is anchored to receipt time. Bound projected uptime
+timestamps to receipt time and shift the current map, ordering watermark and
+queued partial frames together. Genuine wall-clock timestamps are unchanged.
+The parent ran 24 network-guarded map/diagnostic tests successfully, including
+the full native HA service-to-camera legacy inline response path.
+
+Actual saved-report replay confirms the projection fix. An empty successful
+map-action reply still supplies no base frame; keep the partial map queued and
+request a full frame through the bounded repair path. This is offline candidate
+verification, not evidence of sustained physical-run map acceptance.
