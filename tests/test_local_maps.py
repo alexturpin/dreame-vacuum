@@ -10,14 +10,22 @@ import zlib
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.padding import PKCS7
+from homeassistant.const import STATE_UNAVAILABLE
 from PIL import Image
+import pytest
 
+from custom_components.dreame_vacuum.const import DOMAIN
 from custom_components.dreame_vacuum.dreame.local_map import DreameLocalMapManager
-from custom_components.dreame_vacuum.dreame.map import DreameVacuumMapDataJsonRenderer, DreameVacuumMapRenderer
+from custom_components.dreame_vacuum.dreame.map import (
+    DreameMapVacuumMapManager,
+    DreameVacuumMapDataJsonRenderer,
+    DreameVacuumMapRenderer,
+)
 from custom_components.dreame_vacuum.dreame.types import (
     DreameVacuumDeviceCapability,
     DreameVacuumPropertyMapping,
 )
+from test_local_bridge import _VACUUM, _load_entry, candidate_bridge  # noqa: F401
 
 
 OBJECT = "local/" + "a" * 32 + "/2"
@@ -30,13 +38,16 @@ IV = "synthetic-map-iv"
 KEY = "synthetic-key"
 
 
-def frame(frame_id=1, kind="I", *, map_id=7, timestamp=NOW_MS, pixels=None, extra=None, key=None, robot=(50, 50)):
+def frame(
+    frame_id=1, kind="I", *, map_id=7, timestamp=NOW_MS, pixels=None, extra=None,
+    key=None, robot=(50, 50), metadata=None,
+):
     width, height = 8, 8
     pixels = pixels if pixels is not None else bytes([4] * (width * height))
     header = struct.pack("<2hb11h", map_id, frame_id, ord(kind), *robot, 0, 50, 50, 0, 50, width, height, 0, 0)
-    payload = zlib.compress(
-        header + pixels + json.dumps({"timestamp_ms": timestamp, "ris": 2, "fsm": 1, **(extra or {})}).encode()
-    )
+    if metadata is None:
+        metadata = json.dumps({"timestamp_ms": timestamp, "ris": 2, "fsm": 1, **(extra or {})}).encode()
+    payload = zlib.compress(header + pixels + metadata)
     if key:
         padder = PKCS7(128).padder()
         encryptor = Cipher(algorithms.AES(sha256(key.encode()).hexdigest()[:32].encode()), modes.CBC(IV.encode())).encryptor()
@@ -111,6 +122,76 @@ def test_explicit_request_uses_native_action_and_ingests_output():
     assert payload[0]["piid"] == 2
     assert json.loads(payload[0]["value"]) == {"req_type": 1, "frame_type": "I", "force_type": 1}
     assert manager.get_map().frame_id == 1
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_inline_map_action_output_reaches_native_camera(hass, candidate_bridge):
+    entry, coordinator = await _load_entry(hass, candidate_bridge, bridge_read_mode="local_candidate")
+    camera_id = "camera.bridge_test_map"
+    camera = hass.data["camera"].get_entity(camera_id)
+    assert hass.states.get(camera_id).state == STATE_UNAVAILABLE
+    blank = await camera.async_camera_image()
+
+    # Docked smoke evidence established this field layout, with no saved bytes.
+    candidate_bridge.rpc_out = [
+        {"piid": 1, "value": frame(timestamp=1234)},
+        {"piid": 3, "value": ""},
+        {"piid": 5, "value": NOW_MS},
+    ]
+    await hass.services.async_call(DOMAIN, "vacuum_request_map", {"entity_id": _VACUUM}, blocking=True)
+    await hass.async_block_till_done()
+
+    actions = [post["params"] for post in candidate_bridge.posts if post["method"] == "action"]
+    assert len(actions) == 1
+    assert (actions[0]["siid"], actions[0]["aiid"]) == (6, 1)
+    assert json.loads(actions[0]["in"][0]["value"]) == {"req_type": 1, "frame_type": "I", "force_type": 1}
+    assert coordinator.device.status.current_map.timestamp_ms == NOW_MS
+    assert hass.states.get(camera_id).state != STATE_UNAVAILABLE
+    image = await camera.async_camera_image()
+    assert image and image != blank
+    with Image.open(BytesIO(image)) as rendered:
+        rendered.verify()
+    assert [post["params"] for post in candidate_bridge.posts if post["method"] == "action"] == actions
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+def test_invalid_map_frame_does_not_supersede_valid_frame_ordering():
+    manager, _ = setup_manager()
+    manager.ingest_properties([row(1, frame())])
+    manager.ingest_properties([row(1, frame(kind="W", map_id=10, timestamp=NOW_MS + 10))])
+    manager.ingest_properties([row(1, frame(2, timestamp=NOW_MS + 1))])
+    assert manager.get_map().frame_id == 2
+
+
+@pytest.mark.parametrize("invalid_frame", [
+    frame(map_id=10, timestamp=NOW_MS + 10, pixels=b""),
+    frame(map_id=10, metadata=b'{"timestamp_ms":1780000000010,"fsm":'),
+], ids=["truncated-pixels", "malformed-metadata"])
+def test_malformed_inline_frame_does_not_discard_good_map(invalid_frame):
+    manager, protocol = setup_manager()
+    manager.ingest_properties([row(1, frame())])
+    previous = manager.get_map()
+    protocol.out = [{"piid": 1, "value": invalid_frame}, {"piid": 5, "value": NOW_MS + 10}]
+    manager.request_new_map()
+    assert manager.get_map() is previous
+    manager.ingest_properties([row(1, frame(2, timestamp=NOW_MS + 1))])
+    assert manager.get_map().frame_id == 2
+
+
+def test_failed_native_application_does_not_advance_frame_ordering(monkeypatch):
+    manager, _ = setup_manager()
+    apply_frame = DreameMapVacuumMapManager._add_map_data
+
+    def apply_or_raise(manager, partial):
+        if partial.map_id == 10:
+            raise ValueError("synthetic application failure")
+        return apply_frame(manager, partial)
+
+    monkeypatch.setattr(DreameMapVacuumMapManager, "_add_map_data", apply_or_raise)
+    manager.ingest_properties([row(1, frame())])
+    manager.ingest_properties([row(1, frame(map_id=10, timestamp=NOW_MS + 10))])
+    manager.ingest_properties([row(1, frame(2, timestamp=NOW_MS + 1))])
+    assert manager.get_map().frame_id == 2
 
 
 def test_out_of_order_delta_waits_passively_and_reset_clears_floor_plan():

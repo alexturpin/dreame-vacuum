@@ -12,7 +12,7 @@ import time
 from PIL import Image
 
 from .exceptions import DeviceException
-from .map import DreameMapVacuumMapEditor, DreameMapVacuumMapManager
+from .map import DreameMapVacuumMapEditor, DreameMapVacuumMapManager, DreameVacuumMapDecoder
 from .types import CleaningHistory, MapFrameType
 
 _LOGGER = logging.getLogger(__name__)
@@ -83,6 +83,12 @@ class DreameLocalMapManager(DreameMapVacuumMapManager):
                 self._map_data, self._saved_map_data, self._map_list, self._selected_map_id,
                 self._current_map_id, self._current_frame_id, self._current_timestamp_ms, self._updated_frame_id,
             ))
+
+    @property
+    def revision(self) -> int:
+        """Return the current revision of observed map state."""
+        with self._lock:
+            return self._revision
 
     def restore_checkpoint(self, checkpoint):
         revision, state = checkpoint
@@ -166,18 +172,41 @@ class DreameLocalMapManager(DreameMapVacuumMapManager):
     def _ingest_frame(self, raw, timestamp, key=None):
         if not isinstance(raw, str) or not 0 < len(raw) <= _MAX_MAP_OBJECT_BYTES:
             return False
-        fingerprint = sha256((raw + "," + (key or "")).encode()).digest()
-        if fingerprint in self._recent_frames:
-            return False
-        self._recent_frames.append(fingerprint)
-        self._recent_frames = self._recent_frames[-32:]
+        watermark = self._latest_map_timestamp_ms, self._latest_map_id
         try:
-            partial = self._decode_map_partial(raw, timestamp or int(time.time() * 1000), key)
+            fingerprint = sha256((raw + "," + (key or "")).encode()).digest()
+            if fingerprint in self._recent_frames:
+                return False
+            self._recent_frames.append(fingerprint)
+            self._recent_frames = self._recent_frames[-32:]
+            decoder = DreameVacuumMapDecoder
+            partial = decoder.decode_map_partial(raw, self.map_version, self._aes_iv, key)
             if partial is None or partial.frame_type not in (MapFrameType.I.value, MapFrameType.P.value):
                 return False
+            width = decoder._read_int_16_le(partial.raw, 19)
+            height = decoder._read_int_16_le(partial.raw, 21)
+            pixels_end = decoder.HEADER_SIZE + width * height
+            if len(partial.raw) < pixels_end:
+                _LOGGER.warning("Ignoring a local map frame with incomplete pixels")
+                return False
+            # The native decoder uses {} for both absent/empty metadata and
+            # metadata it could not parse. Resolve that ambiguity when bytes exist.
+            if len(partial.raw) > pixels_end and not partial.data_json:
+                if json.loads(partial.raw[pixels_end:].decode("utf8")) != {}:
+                    _LOGGER.warning("Ignoring a local map frame with invalid metadata")
+                    return False
+
+            # Match the native manager's uptime correction, but only let a
+            # supported, complete frame set the ordering watermark.
+            if partial.timestamp_ms is None or partial.timestamp_ms < 1577826000000:
+                partial.timestamp_ms = timestamp or int(time.time() * 1000)
+            if self._latest_map_timestamp_ms is None or partial.timestamp_ms > self._latest_map_timestamp_ms:
+                self._latest_map_timestamp_ms = partial.timestamp_ms
+                self._latest_map_id = partial.map_id
             before = self._current_map_id, self._current_frame_id, self._current_timestamp_ms
             super()._add_map_data(partial)
-        except (ArithmeticError, IndexError, KeyError, TypeError, ValueError):
+        except (ArithmeticError, IndexError, KeyError, RecursionError, TypeError, ValueError):
+            self._latest_map_timestamp_ms, self._latest_map_id = watermark
             _LOGGER.warning("Ignoring an invalid local map frame")
             return False
         changed = before != (self._current_map_id, self._current_frame_id, self._current_timestamp_ms)

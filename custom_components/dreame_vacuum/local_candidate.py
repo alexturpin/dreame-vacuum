@@ -20,6 +20,7 @@ from yarl import URL
 from homeassistant.const import CONF_NAME, EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.update_coordinator import UpdateFailed
 
 from .const import LOGGER
 from .coordinator import DreameVacuumDataUpdateCoordinator
@@ -34,6 +35,13 @@ from .local_bridge import (
 
 MODEL = "dreame.vacuum.r2250"
 _STATE_INTERVAL = 3
+_STATE_HTTP_TIMEOUT = 4  # Allow delivery after the bridge's three-second owner deadline.
+_STATE_SERVICE_ERRORS = {
+    "busy": "A bridge state request is already in progress",
+    "owner_unavailable": "The owner relay is unavailable",
+    "owner_timeout": "The owner relay timed out",
+    "invalid_owner_response": "The owner relay returned an invalid state reply",
+}
 _RPC_TIMEOUT = 6
 _RESPONSE_LIMIT = 512 * 1024
 _OBJECT = re.compile(r"local/[0-9a-f]{32}(?:/[0-9]{1,4})?")
@@ -159,7 +167,10 @@ class CandidateBridgeClient(LocalBridgeClient):
             raise ValueError("Local candidate requires a pinned HTTPS bridge")
 
     async def async_candidate_state(self) -> CandidateSnapshot:
-        data = await self._request("GET", "/v1/candidate/state", 3, max_bytes=_RESPONSE_LIMIT)
+        data = await self._request(
+            "GET", "/v1/candidate/state", _STATE_HTTP_TIMEOUT,
+            max_bytes=_RESPONSE_LIMIT, service_errors=_STATE_SERVICE_ERRORS,
+        )
         fields = {"version", "epoch", "connected", "ready", "sequence", "properties", "history", "map_reports"}
         if data.keys() != fields:
             raise LocalBridgeError("Invalid candidate state envelope")
@@ -511,9 +522,11 @@ class LocalCandidateCoordinator(DreameVacuumDataUpdateCoordinator):
     async def _async_poll(self):
         if self._closed:
             return self.device
+        state_failure = None
         try:
             snapshot = await self.bridge.async_candidate_state()
-        except LocalBridgeError:
+        except LocalBridgeError as exc:
+            state_failure = exc
             snapshot = CandidateSnapshot(None, False, 0, {}, self._history or [], {})
         if self._closed:
             return self.device
@@ -573,7 +586,8 @@ class LocalCandidateCoordinator(DreameVacuumDataUpdateCoordinator):
                 # a later batch. The next tick bootstraps the new session.
                 try:
                     current = await self.bridge.async_candidate_state()
-                except LocalBridgeError:
+                except LocalBridgeError as exc:
+                    state_failure = exc
                     current = CandidateSnapshot(None, False, 0, {}, [], {})
                 if self._closed:
                     return self.device
@@ -608,6 +622,9 @@ class LocalCandidateCoordinator(DreameVacuumDataUpdateCoordinator):
         )
         if self._goto is not None:
             self._goto_update.set()
+        if state_failure is not None:
+            # Candidate state errors carry fixed local text, including mapped 503 replies.
+            raise UpdateFailed(f"Local bridge state unavailable. {state_failure}") from None
         return self.device
 
     async def async_execute_command(self, func: Callable, *args, **kwargs):
@@ -623,11 +640,12 @@ class LocalCandidateCoordinator(DreameVacuumDataUpdateCoordinator):
             or epoch != self.protocol.epoch or not self.device.available
         ):
             raise LocalBridgeError("The local vacuum is unavailable")
+        maps = self.device._map_manager
+        revision = maps.revision
         command = _Command(epoch)
         worker = self.hass.async_add_executor_job(self._execute, command, func, args, kwargs)
         try:
             result = await asyncio.shield(worker)
-            return result, command
         except asyncio.CancelledError:
             await worker
             raise
@@ -643,6 +661,11 @@ class LocalCandidateCoordinator(DreameVacuumDataUpdateCoordinator):
                     # including a same-value write or an uncertain result.
                     for prop in command.readback:
                         self._goto.restore.pop(prop, None)
+        if self.protocol.epoch == epoch and maps.revision != revision:
+            # An acknowledged request can deliver a frame inline. Publish the
+            # updated map without restarting the state polling interval.
+            self.async_update_listeners()
+        return result, command
 
     def _execute(self, command, func, args, kwargs):
         maps = self.device._map_manager

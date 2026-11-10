@@ -299,3 +299,20 @@ construction forbidden. On the test Mac, Camera's Home Assistant dependency
 requires `PyTurboJPEG` from `tests/requirements.txt` and
 `DYLD_LIBRARY_PATH=/opt/homebrew/lib` for the local library. Deployment and
 physical tests require a separately agreed supervised scope.
+
+
+## Post-smoke hardening candidate (local.10)
+
+This source revision is separate from the installed local.9 smoke-test build.
+Candidate state requests now distinguish a failed owner relay from a validated
+robot-disconnected state. Fixed, bounded errors identify unavailable, timed-out
+or invalid owner responses; no SSH diagnostics, addresses, credentials or raw
+payloads are exposed. The HA coordinator clears stale observations before
+reporting a failed update, and recovers when a valid state response returns.
+
+Use `dreame_vacuum.vacuum_request_map` with the vacuum entity to request a frame
+through the native map manager and camera. Successful commands that change map
+revision notify HA listeners immediately without restarting the polling timer
+or issuing another request. Reading a candidate camera image does not itself
+send a map request. See [the map ingestion review](MAP_INGESTION_REVIEW.md) for
+synthetic verification and the remaining physical rendering acceptance.

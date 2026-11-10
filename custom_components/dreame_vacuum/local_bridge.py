@@ -100,6 +100,7 @@ _RUN_INTERVAL = 125
 _RUN_WAKE_TOLERANCE = 5
 _RUN_MAX_RESPONSE_BYTES = 2048
 _MAX_RESPONSE_BYTES = 4096
+_MAX_SERVICE_ERROR_BYTES = 256
 _MAX_SEQUENCE = (1 << 53) - 1
 _HEX_ID = re.compile(r"[0-9a-f]{32}")
 _TOKEN = re.compile(r"[A-Za-z0-9_-]{32,128}")
@@ -287,6 +288,7 @@ class LocalBridgeClient:
         version: int = _VERSION,
         max_bytes: int | None = None,
         query: dict | None = None,
+        service_errors: Mapping[str, str] | None = None,
     ) -> dict:
         if max_bytes is None:
             max_bytes = _RUN_MAX_RESPONSE_BYTES if version == _RUN_VERSION else _MAX_RESPONSE_BYTES
@@ -299,14 +301,16 @@ class LocalBridgeClient:
                 allow_redirects=False,
                 timeout=ClientTimeout(total=timeout, ceil_threshold=float("inf")),
                 json=payload,
-                auto_decompress=False if version == _RUN_VERSION else None,
+                auto_decompress=False if version == _RUN_VERSION or service_errors is not None else None,
             ) as response:
                 if response.status == 401:
                     raise LocalBridgeError("Bridge authentication failed")
-                if response.status != 200 or response.content_type != "application/json":
+                service_error = response.status == 503 and service_errors is not None
+                if (response.status != 200 and not service_error) or response.content_type != "application/json":
                     raise LocalBridgeError("Invalid bridge HTTP response")
+                limit = _MAX_SERVICE_ERROR_BYTES if service_error else max_bytes
                 try:
-                    await response.content.readexactly(max_bytes + 1)
+                    await response.content.readexactly(limit + 1)
                 except IncompleteReadError as exc:
                     value = json.loads(
                         exc.partial, object_pairs_hook=_unique_json_object, parse_constant=_reject_json_constant
@@ -317,6 +321,11 @@ class LocalBridgeClient:
             raise LocalBridgeError("Bridge request failed") from None
         if not isinstance(value, dict) or type(value.get("version")) is not int or value["version"] != version:
             raise LocalBridgeError("Invalid bridge protocol version")
+        if service_error and service_errors is not None:
+            error = value.get("error")
+            if value.keys() == {"version", "error"} and type(error) is str and error in service_errors:
+                raise LocalBridgeError(service_errors[error])
+            raise LocalBridgeError("Invalid bridge service error")
         return value
 
     async def async_get_state(self) -> BridgeSnapshot:
