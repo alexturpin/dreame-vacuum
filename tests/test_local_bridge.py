@@ -102,6 +102,8 @@ class FakeBridge:
     """HTTP fixture with independently controlled reports and RPC replies."""
 
     state: dict = field(default_factory=lambda: _state(epoch=None))
+    actions: list[dict] = field(default_factory=list)
+    action_fault: str | None = None
     posts: list[dict] = field(default_factory=list)
     gets: int = 0
     token: str = _TOKEN
@@ -125,6 +127,21 @@ class FakeBridge:
         if self.raw_state is not None:
             return web.Response(text=self.raw_state, content_type="application/json", status=self.status)
         return web.json_response(self.state, status=self.status)
+
+    async def post_action(self, request):
+        if request.headers.get("Authorization") != f"Bearer {self.token}":
+            raise web.HTTPUnauthorized()
+        payload = await request.json()
+        self.actions.append(payload)
+        reply = {"version": 1, "request_id": payload["request_id"], "epoch": payload["epoch"],
+                 "result": {"action": payload["action"], "code": 0}}
+        if self.action_fault == "identity":
+            reply["request_id"] = "f" * 32
+        elif self.action_fault == "rejected":
+            reply["result"]["code"] = -1
+        elif self.action_fault == "http":
+            raise web.HTTPServiceUnavailable()
+        return web.json_response(reply)
 
     async def post_read(self, request):
         if request.headers.get("Authorization") != f"Bearer {self.token}":
@@ -1162,6 +1179,7 @@ async def run_bridge(aiohttp_server, socket_enabled, tmp_path):
     app = web.Application()
     app.router.add_get("/v1/state", bridge.get_state)
     app.router.add_post("/v1/read", bridge.post_read)
+    app.router.add_post("/v1/action", bridge.post_action)
     app.router.add_post("/v2/refresh/{action:claim|read|abort}", bridge.post_run)
     server = await aiohttp_server(app, ssl=context)
     bridge.url = str(server.make_url("/").origin())
@@ -1857,3 +1875,49 @@ async def test_finite_run_releases_busy_if_progress_notification_raises(
     assert run_bridge.gets == gets + 1
     assert not run_bridge.posts
     assert len(run_bridge.aborts) == (1 if at_state == "sampling" else 0)
+
+
+async def _load_control_entry(hass, bridge):
+    return await _load_entry(hass, bridge, **{
+        CONF_BRIDGE_READ_MODE: local_bridge.READ_MODE_ON_DEMAND,
+        CONF_BRIDGE_FINGERPRINT: bridge.pin,
+    })
+
+
+async def test_local_start_pause_buttons_work_without_a_solicited_snapshot(hass, run_bridge, hass_admin_user):
+    entry, coordinator = await _load_control_entry(hass, run_bridge)
+    assert hass.states.get(_VACUUM).state == STATE_UNAVAILABLE
+    context = Context(user_id=hass_admin_user.id)
+    for action, entity in (("start", "button.bridge_test_start_cleaning"), ("pause", "button.bridge_test_pause")):
+        assert hass.states.get(entity).state != STATE_UNAVAILABLE
+        await hass.services.async_call("button", "press", {"entity_id": entity}, blocking=True, context=context)
+        assert run_bridge.actions[-1]["action"] == action
+    assert len(run_bridge.actions) == 2
+    assert not run_bridge.posts and not run_bridge.claims
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert len(run_bridge.actions) == 2  # Reload does not initiate movement.
+
+
+@pytest.mark.parametrize("fault", ["identity", "rejected", "http"])
+async def test_local_action_failure_does_not_retry(hass, run_bridge, hass_admin_user, fault):
+    _, coordinator = await _load_control_entry(hass, run_bridge)
+    run_bridge.action_fault = fault
+    with pytest.raises(HomeAssistantError):
+        await coordinator.async_control("start", Context(user_id=hass_admin_user.id))
+    assert len(run_bridge.actions) == 1
+    assert coordinator._action_busy is False
+    run_bridge.action_fault = None
+    await coordinator.async_control("pause", Context(user_id=hass_admin_user.id))
+    assert [p["action"] for p in run_bridge.actions] == ["start", "pause"]
+
+
+async def test_local_controls_reject_internal_automated_and_non_admin_calls(hass, run_bridge, hass_admin_user):
+    _, coordinator = await _load_control_entry(hass, run_bridge)
+    user = await hass.auth.async_create_user("Non admin")
+    for context in (Context(), Context(user_id=user.id), Context(user_id=hass_admin_user.id, parent_id="automation")):
+        with pytest.raises(HomeAssistantError):
+            await coordinator.async_control("start", context)
+    assert not run_bridge.actions
+    assert not run_bridge.posts

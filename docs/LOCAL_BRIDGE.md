@@ -201,3 +201,22 @@ methods, and distinct lifecycle rules before enabling discovery, timers, or
 legacy services. The current checkpoint covers the live HA lifecycle and
 bounded read-only contract, with that expansion pending separate evidence
 and authorization.
+
+
+## Manual start/pause buttons (local.7)
+
+On-demand entries expose **Start cleaning** and **Pause** buttons on the existing
+device. Availability follows the passive connection, independently of the
+60-second solicited vacuum snapshot. A direct authenticated administrator press
+is required; internal/automation contexts and non-admin users are rejected.
+Each press sends one `POST /v1/action` with version, fresh request ID, current
+epoch and an action name (`start` or `pause`). No arbitrary parameters, retries,
+optimistic activity changes or additional robot reads are performed.
+
+The owner must explicitly enable its HA-control policy. The installed bridge
+still enforces its pinned TLS/credentials, action allowlist and session/replay
+checks. Pause revokes unfinished reads before attempting its single action.
+A missing response is an unknown outcome: check the robot rather than assuming
+it did not move. These buttons are not an emergency stop. Startup, reconnect,
+reload and passive polling never send actions. The vacuum entity itself retains
+zero control features; use these buttons, not legacy upstream vacuum services.

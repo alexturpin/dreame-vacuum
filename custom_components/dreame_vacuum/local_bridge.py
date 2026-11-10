@@ -337,6 +337,24 @@ class LocalBridgeClient:
             raise LocalBridgeError("Invalid bridge telemetry readiness")
         return BridgeSnapshot(epoch, sequence, properties)
 
+    async def async_action(self, epoch: str, action: str) -> None:
+        """One fixed movement command, with no retry or ancillary robot requests."""
+        if action not in ("start", "pause") or not _is_hex_id(epoch):
+            raise LocalBridgeError("Invalid local action")
+        request = {"version": 1, "request_id": token_hex(16), "epoch": epoch, "action": action}
+        reply = await self._request("POST", "/v1/action", 6, request)
+        if reply.get("request_id") != request["request_id"] or reply.get("epoch") != epoch:
+            raise LocalBridgeError("Action outcome unknown: response identity mismatch; do not retry automatically")
+        if reply.keys() == {"version", "request_id", "epoch", "error"}:
+            raise LocalBridgeError("Local action failed or outcome unknown; check the robot before another command")
+        result = reply.get("result")
+        if (reply.keys() != {"version", "request_id", "epoch", "result"} or type(result) is not dict
+                or result.keys() != {"action", "code"} or result["action"] != action
+                or type(result["code"]) is not int):
+            raise LocalBridgeError("Action outcome unknown: invalid response")
+        if result["code"] != 0:
+            raise LocalBridgeError(f"Robot rejected {action} (code {result['code']})")
+
     async def async_read_battery(self, epoch: str) -> int:
         """Make one explicitly requested battery read using the original contract."""
         result, _ = await self.async_read_property(epoch, _BATTERY_ADDRESS, None)
@@ -538,6 +556,7 @@ class LocalBridgeCoordinator(DataUpdateCoordinator[DreameVacuumDevice]):
             hass, LOGGER, config_entry=entry, name=DOMAIN, update_interval=timedelta(seconds=10)
         )
         self.device = DreameVacuumDevice(entry.data[CONF_NAME], None, None, local_bridge=True)
+        self._action_busy = False
         self._busy = False
         self._epoch: str | None = None
         self._sequence = 0
@@ -565,6 +584,31 @@ class LocalBridgeCoordinator(DataUpdateCoordinator[DreameVacuumDevice]):
             entry.async_on_unload(
                 hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, self._async_stop_refresh_run)
             )
+
+    async def async_control(self, action: str, context) -> None:
+        """Require a direct admin press; actions are independent of snapshot expiry."""
+        if not context.user_id or context.parent_id is not None:
+            raise LocalBridgeError("Movement requires a direct authenticated administrator press")
+        user = await self.hass.auth.async_get_user(context.user_id)
+        if user is None or not user.is_admin:
+            raise LocalBridgeError("Movement requires an administrator")
+        if self._read_mode != READ_MODE_ON_DEMAND or action not in ("start", "pause"):
+            raise LocalBridgeError("Local control is unavailable")
+        if self._closed or self._epoch is None or not self.device.available:
+            raise LocalBridgeError("Robot is unavailable")
+        if self._action_busy:
+            raise LocalBridgeError("A local action is already in progress")
+        self._action_busy = True
+        try:
+            # Cancel a pending snapshot locally. The owner independently revokes
+            # reads before sending an action; do not wait for an abort round trip.
+            if self._run is not None:
+                self._end_refresh_run(self._run, "cancelled", "movement_requested")
+            self._clear_refresh_snapshot()
+            self.async_update_listeners()
+            await self._bridge.async_action(self._epoch, action)
+        finally:
+            self._action_busy = False
 
     @property
     def state_refresh_enabled(self) -> bool:

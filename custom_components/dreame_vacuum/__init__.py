@@ -57,7 +57,7 @@ PLATFORMS = (
 )
 
 
-LOCAL_BRIDGE_PLATFORMS = (Platform.VACUUM, Platform.SENSOR)
+LOCAL_BRIDGE_PLATFORMS = (Platform.VACUUM, Platform.SENSOR, Platform.BUTTON)
 
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)

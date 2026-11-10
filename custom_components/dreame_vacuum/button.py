@@ -20,6 +20,7 @@ from homeassistant.helpers.entity import EntityCategory, async_generate_entity_i
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers import entity_registry
 from .const import DOMAIN
+from .local_bridge import LocalBridgeEntity, READ_MODE_ON_DEMAND, is_local_bridge
 
 from .coordinator import DreameVacuumDataUpdateCoordinator
 from .entity import DreameVacuumEntity, DreameVacuumEntityDescription, remove_entities
@@ -318,6 +319,11 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up Dreame Vacuum Button based on a config entry."""
+    if is_local_bridge(entry.data):
+        coordinator = hass.data[DOMAIN][entry.entry_id]
+        if coordinator._read_mode == READ_MODE_ON_DEMAND:
+            async_add_entities([LocalBridgeControlButton(coordinator, action) for action in ("start", "pause")])
+        return
     coordinator: DreameVacuumDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
 
     remove_entities(hass, entry, coordinator, "button", BUTTONS)
@@ -521,3 +527,16 @@ class DreameVacuumShortcutButtonEntity(DreameVacuumEntity, ButtonEntity):
             self.device.start_shortcut,
             self.shortcut_id,
         )
+
+
+class LocalBridgeControlButton(LocalBridgeEntity, ButtonEntity):
+    """Explicit start/pause buttons using the authenticated local bridge."""
+
+    def __init__(self, coordinator, action: str) -> None:
+        super().__init__(coordinator, f"local_{action}")
+        self._action = action
+        self._attr_name = "Start cleaning" if action == "start" else "Pause"
+        self._attr_icon = "mdi:play" if action == "start" else "mdi:pause"
+
+    async def async_press(self) -> None:
+        await self.coordinator.async_control(self._action, self._context)
