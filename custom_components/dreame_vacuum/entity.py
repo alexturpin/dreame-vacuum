@@ -32,6 +32,82 @@ from .dreame import (
 )
 
 
+def setup_native_entities(hass, entry, coordinator, domain, descriptions, entity_type, async_add_entities):
+    """Discover supported candidate entities without removing stale registry IDs."""
+    if not coordinator.device._local_candidate:
+        remove_entities(hass, entry, coordinator, domain, descriptions)
+        async_add_entities(
+            entity_type(coordinator, description)
+            for description in descriptions
+            if description.exists_fn(description, coordinator.device)
+        )
+        return
+
+    added = set()
+
+    @callback
+    def discover():
+        device = coordinator.device
+        if not device.capability.loaded:
+            return
+        entities = []
+        for index, description in enumerate(descriptions):
+            if (
+                index in added
+                or not device._protocol.supports_entity(domain, description)
+                or not description.exists_fn(description, device)
+                or not candidate_field_present(device, description)
+            ):
+                continue
+            entities.append(entity_type(coordinator, description))
+            added.add(index)
+        if entities:
+            async_add_entities(entities)
+
+    entry.async_on_unload(coordinator.async_add_listener(discover))
+    discover()
+
+
+_CANDIDATE_ACTION_FIELDS = {
+    DreameVacuumAction.RESET_MAIN_BRUSH: DreameVacuumProperty.MAIN_BRUSH_LEFT,
+    DreameVacuumAction.RESET_SIDE_BRUSH: DreameVacuumProperty.SIDE_BRUSH_LEFT,
+    DreameVacuumAction.RESET_FILTER: DreameVacuumProperty.FILTER_LEFT,
+    DreameVacuumAction.RESET_SENSOR: DreameVacuumProperty.SENSOR_DIRTY_LEFT,
+    DreameVacuumAction.RESET_MOP_PAD: DreameVacuumProperty.MOP_PAD_LEFT,
+    DreameVacuumAction.CLEAR_WARNING: DreameVacuumProperty.ERROR,
+}
+
+
+def candidate_field_present(device, description) -> bool:
+    """Return whether the current snapshot backs this entity's value."""
+    key = description.key
+    if key in ("dnd", "dnd_start", "dnd_end") and device.capability.dnd_task:
+        prop = DreameVacuumProperty.DND_TASK
+    else:
+        prop = description.property_key
+    if prop is None and description.action_key is not None:
+        prop = _CANDIDATE_ACTION_FIELDS.get(description.action_key)
+    if prop is None:
+        prop = {
+            "dnd": DreameVacuumProperty.DND,
+            "dnd_start": DreameVacuumProperty.DND_START,
+            "dnd_end": DreameVacuumProperty.DND_END,
+            "off_peak_charging": DreameVacuumProperty.OFF_PEAK_CHARGING,
+            "off_peak_charging_start": DreameVacuumProperty.OFF_PEAK_CHARGING,
+            "off_peak_charging_end": DreameVacuumProperty.OFF_PEAK_CHARGING,
+            "charging_state": DreameVacuumProperty.CHARGING_STATUS,
+            "problem": DreameVacuumProperty.ERROR,
+        }.get(key)
+    if key == "current_room":
+        return device.status.current_room is not None
+    if key == "maintenance":
+        return any(device.get_property(item) is not None for item in (
+            DreameVacuumProperty.MAIN_BRUSH_LEFT, DreameVacuumProperty.SIDE_BRUSH_LEFT,
+            DreameVacuumProperty.FILTER_LEFT, DreameVacuumProperty.SENSOR_DIRTY_LEFT, DreameVacuumProperty.MOP_PAD_LEFT,
+        ))
+    return prop is None or device.get_property(prop) is not None
+
+
 def remove_entities(hass, entry, coordinator, domain, descriptions):
     """Remove entities from registry that are no longer provided by the integration"""
 
@@ -216,7 +292,10 @@ class DreameVacuumEntity(CoordinatorEntity[DreameVacuumDataUpdateCoordinator]):
             self._raise_error(DeviceUnavailableException())
 
         try:
-            await self.hass.async_add_executor_job(partial(func, *args, **kwargs))
+            if self.device._local_candidate:
+                await self.coordinator.async_execute_command(func, *args, **kwargs)
+            else:
+                await self.hass.async_add_executor_job(partial(func, *args, **kwargs))
             return True
         except InvalidActionException as exc:
             LOGGER.error(mask_error, exc)
@@ -245,6 +324,13 @@ class DreameVacuumEntity(CoordinatorEntity[DreameVacuumDataUpdateCoordinator]):
     @property
     def device_info(self) -> DeviceInfo:
         """Return device information about this Dreame Vacuum device."""
+        if self.device._local_candidate:
+            return DeviceInfo(
+                identifiers={(DOMAIN, self.device.mac)},
+                name=self.device.name,
+                manufacturer="Dreame",
+                model=self.device.info.model,
+            )
         if self.device.info:
             return DeviceInfo(
                 connections={(CONNECTION_NETWORK_MAC, self.device.info.mac_address or self.device.mac)},
@@ -263,6 +349,8 @@ class DreameVacuumEntity(CoordinatorEntity[DreameVacuumDataUpdateCoordinator]):
         if not self.device.device_connected:
             return False
 
+        if self.device._local_candidate and not candidate_field_present(self.device, self.entity_description):
+            return False
         if self.entity_description.available_fn is not None:
             return self.entity_description.available_fn(self.device)
         return self._attr_available
@@ -271,6 +359,8 @@ class DreameVacuumEntity(CoordinatorEntity[DreameVacuumDataUpdateCoordinator]):
     def native_value(self) -> Any:
         """Return the native value of the entity."""
         value = None
+        if self.device._local_candidate and not candidate_field_present(self.device, self.entity_description):
+            return None
         if self.entity_description.property_key is not None:
             value = self.device.get_property(self.entity_description.property_key)
         if self.entity_description.value_fn is not None:
@@ -281,6 +371,8 @@ class DreameVacuumEntity(CoordinatorEntity[DreameVacuumDataUpdateCoordinator]):
     def extra_state_attributes(self) -> dict[str, str] | None:
         """Return the extra state attributes of the entity."""
         attrs = None
+        if self.device._local_candidate and not candidate_field_present(self.device, self.entity_description):
+            return None
         if self.entity_description.attrs_fn is not None:
             attrs = self.entity_description.attrs_fn(self)
         elif self.entity_description.value_fn is not None or self.entity_description.value_int_fn is not None:

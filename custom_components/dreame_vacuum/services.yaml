@@ -544,3 +544,51 @@ vacuum_set_obstacle_ignore:
       selector:
         boolean:
 
+
+vacuum_delete_scheduled_task:
+  target:
+    entity:
+      domain: vacuum
+      integration: dreame_vacuum
+  fields:
+    schedule_id:
+      required: true
+      selector:
+        number:
+          min: 1
+          mode: box
+
+vacuum_delete_dnd_task:
+  target:
+    entity:
+      domain: vacuum
+      integration: dreame_vacuum
+  fields:
+    dnd_id:
+      required: true
+      selector:
+        number:
+          min: 1
+          mode: box
+
+vacuum_set_schedule:
+  target:
+    entity:
+      domain: vacuum
+      integration: dreame_vacuum
+  fields:
+    schedule:
+      required: true
+      selector:
+        text:
+
+vacuum_set_dnd_tasks:
+  target:
+    entity:
+      domain: vacuum
+      integration: dreame_vacuum
+  fields:
+    tasks:
+      required: true
+      selector:
+        object:

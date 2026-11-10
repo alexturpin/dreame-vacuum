@@ -1223,6 +1223,13 @@ class DreameMapVacuumMapManager:
                 ).decode("utf-8")
         return self._aes_key
 
+    @staticmethod
+    def _decode_obstacle_object(response: bytes, key: str) -> bytes:
+        cipher = Cipher(algorithms.AES(hashlib.md5(key.encode("utf-8")).digest()), modes.ECB())
+        decryptor = cipher.decryptor()
+        unpadder = padding.PKCS7(128).unpadder()
+        return unpadder.update(decryptor.update(response) + decryptor.finalize()) + unpadder.finalize()
+
     def get_obstacle_image(self, map_data, index):
         index = str(index)
         if map_data and map_data.obstacles and index in map_data.obstacles:
@@ -1269,27 +1276,7 @@ class DreameMapVacuumMapManager:
                         if response:
                             response = self._protocol.cloud.get_file(response)
                             if response:
-                                response = base64.b64encode(response).decode("utf-8")
-
-                                cipher = Cipher(
-                                    algorithms.AES(
-                                        bytearray.fromhex(hashlib.md5((obstacle.key).encode("utf-8")).hexdigest())
-                                    ),
-                                    modes.ECB(),
-                                    backend=default_backend(),
-                                )
-                                decryptor = cipher.decryptor()
-                                unpadder = padding.PKCS7(128).unpadder()
-                                return (
-                                    (
-                                        unpadder.update(
-                                            decryptor.update(base64.b64decode(response[response.find(",") + 1 :]))
-                                            + decryptor.finalize()
-                                        )
-                                        + unpadder.finalize()
-                                    ),
-                                    obstacle,
-                                )
+                                return self._decode_obstacle_object(response, obstacle.key), obstacle
                 except:
                     _LOGGER.warning(
                         "Obstacle (%s) image decryption failed: %s",
@@ -1298,6 +1285,10 @@ class DreameMapVacuumMapManager:
                     )
         return (None, None)
 
+    def _get_history_file_data(self, object_name):
+        url = self._get_file_url(object_name, self._protocol.cloud.dreame_cloud)
+        return self._protocol.cloud.get_file(url) if url else None
+
     def get_history_map(self, object_name, key=None):
         if object_name and len(object_name):
             try:
@@ -1305,33 +1296,31 @@ class DreameMapVacuumMapManager:
                     "History map object name: %s",
                     object_name,
                 )
-                response = self._get_file_url(object_name, self._protocol.cloud.dreame_cloud)
+                response = self._get_history_file_data(object_name)
                 if response:
-                    response = self._protocol.cloud.get_file(response)
-                    if response:
-                        map_data, saved_map_data = DreameVacuumMapDecoder.decode_map(
-                            response.decode(), self.map_version, None, self._aes_iv, key
+                    map_data, saved_map_data = DreameVacuumMapDecoder.decode_map(
+                        response.decode(), self.map_version, None, self._aes_iv, key
+                    )
+                    if saved_map_data:
+                        DreameVacuumMapDecoder.set_capability(saved_map_data, self._capability)
+                        DreameVacuumMapDecoder.set_floor_material(saved_map_data, self._capability)
+                    if map_data:
+                        DreameVacuumMapDecoder.set_capability(map_data, self._capability)
+                        DreameVacuumMapDecoder.set_segment_cleanset(
+                            map_data,
+                            map_data.cleanset,
+                            self._capability,
                         )
-                        if saved_map_data:
-                            DreameVacuumMapDecoder.set_capability(saved_map_data, self._capability)
-                            DreameVacuumMapDecoder.set_floor_material(saved_map_data, self._capability)
-                        if map_data:
-                            DreameVacuumMapDecoder.set_capability(map_data, self._capability)
-                            DreameVacuumMapDecoder.set_segment_cleanset(
-                                map_data,
-                                map_data.cleanset,
-                                self._capability,
-                            )
-                            DreameVacuumMapDecoder.set_carpet_cleanset(
-                                map_data, map_data.carpet_cleanset, self._capability
-                            )
-                            DreameVacuumMapDecoder.set_floor_material(map_data, self._capability, saved_map_data)
+                        DreameVacuumMapDecoder.set_carpet_cleanset(
+                            map_data, map_data.carpet_cleanset, self._capability
+                        )
+                        DreameVacuumMapDecoder.set_floor_material(map_data, self._capability, saved_map_data)
 
-                            map_data.history_map = True
-                            if map_data.need_optimization:
-                                map_data = self.optimizer.optimize(map_data, saved_map_data)
-                                map_data.need_optimization = False
-                            return map_data
+                        map_data.history_map = True
+                        if map_data.need_optimization:
+                            map_data = self.optimizer.optimize(map_data, saved_map_data)
+                            map_data.need_optimization = False
+                        return map_data
             except Exception as ex:
                 _LOGGER.warning(
                     "History map decoding failed: %s",
@@ -1626,11 +1615,15 @@ class DreameMapVacuumMapManager:
                 return True
         return False
 
-    def request_map_list(self) -> None:
-        if self._map_list_object_name and self._protocol.cloud.logged_in:
+    def _map_objects_available(self) -> bool:
+        return self._protocol.cloud.logged_in
+
+    def request_map_list(self, response=None) -> bool | None:
+        if self._map_list_object_name and self._map_objects_available():
             _LOGGER.info("Get Map List: %s", self._map_list_object_name)
             try:
-                response = self._get_interim_file_data(self._map_list_object_name)
+                if response is None:
+                    response = self._get_interim_file_data(self._map_list_object_name)
             except Exception as ex:
                 _LOGGER.warning("Get Map List failed: %s", ex)
                 return
@@ -1657,6 +1650,8 @@ class DreameMapVacuumMapManager:
                                 response = self._get_interim_file_data(v["rismobj"])
                                 if response:
                                     raw_map = response.decode()
+                                else:
+                                    return
                             except Exception as ex:
                                 _LOGGER.warning("Get Saved Map Object failed: %s", ex)
                                 return
@@ -1673,13 +1668,14 @@ class DreameMapVacuumMapManager:
                                 _LOGGER.error("Parse saved map failed: %s", traceback.format_exc())
                                 return
 
-                            if saved_map_data is not None:
-                                name = v.get(MAP_PARAMETER_NAME)
-                                saved_map_data.object_name = v.get("mapobj")
-                                if name:
-                                    saved_map_data.custom_name = name
-                                    saved_map_data.map_name = name
-                                map_list[saved_map_data.map_id] = saved_map_data
+                            if saved_map_data is None:
+                                return
+                            name = v.get(MAP_PARAMETER_NAME)
+                            saved_map_data.object_name = v.get("mapobj")
+                            if name:
+                                saved_map_data.custom_name = name
+                                saved_map_data.map_name = name
+                            map_list[saved_map_data.map_id] = saved_map_data
 
                     for map_id, saved_map_data in sorted(map_list.items()):
                         DreameVacuumMapDecoder.set_capability(saved_map_data, self._capability)
@@ -1761,17 +1757,20 @@ class DreameMapVacuumMapManager:
                     if self._map_data:
                         self._map_data_changed(True)
                     self.request_next_recovery_map_list()
+                return True
 
-    def request_recovery_map_list(self) -> None:
+    def request_recovery_map_list(self, response=None) -> bool | None:
         if self._recovery_map_list_object_name:
             if self.map_version == 0:
                 self._need_recovery_map_list_request = False
                 return
             _LOGGER.info("Get Recovery Map List: %s", self._recovery_map_list_object_name)
-            response = self._get_file_url(self._recovery_map_list_object_name)
+            if response is None:
+                response = self._get_file_url(self._recovery_map_list_object_name)
             if response:
                 self._need_recovery_map_list_request = False
-                response = self._protocol.cloud.get_file(response)
+                if isinstance(response, str):
+                    response = self._protocol.cloud.get_file(response)
                 if response:
                     try:
                         recovery_map_list = json.loads(response.decode())
@@ -1827,7 +1826,8 @@ class DreameMapVacuumMapManager:
                         if self._connected:
                             self._map_data_changed(True)
                     else:
-                        _LOGGER.info("Saved recovery map list not changed: %s", map_id)
+                        _LOGGER.info("Saved recovery map list not changed")
+                    return True
 
     @property
     def _request_i_map_available(self) -> bool:
@@ -4205,7 +4205,10 @@ class DreameVacuumMapDecoder:
             key = values[1]
             raw_map = values[0]
 
-        raw_map = base64.decodebytes(raw_map.encode("utf8"))
+        try:
+            raw_map = base64.decodebytes(raw_map.encode("utf8") + b"=" * (-len(raw_map) % 4))
+        except (ValueError, UnicodeError):
+            return None
 
         if key is not None and iv:
             try:
@@ -4221,9 +4224,16 @@ class DreameVacuumMapDecoder:
                 return None
 
         try:
-            raw_map = zlib.decompress(raw_map)
-            if not raw_map or len(raw_map) < DreameVacuumMapDecoder.HEADER_SIZE:
-                _LOGGER.error("Wrong header size for map")
+            # Bound expansion before interpreting any map dimensions.
+            decoder = zlib.decompressobj()
+            raw_map = decoder.decompress(raw_map, 16 * 1024 * 1024)
+            if not decoder.eof or len(raw_map) < DreameVacuumMapDecoder.HEADER_SIZE:
+                _LOGGER.error("Invalid or oversized compressed map")
+                return None
+            width = DreameVacuumMapDecoder._read_int_16_le(raw_map, 19)
+            height = DreameVacuumMapDecoder._read_int_16_le(raw_map, 21)
+            if min(width, height) < 0 or max(width, height) > 4096 or width * height > 4 * 1024 * 1024:
+                _LOGGER.error("Invalid map dimensions")
                 return None
         except Exception as ex:
             if key is not None and not iv:
@@ -4231,7 +4241,7 @@ class DreameVacuumMapDecoder:
                     f"Map data decryption failed: {ex}. Private key might be missing, please report this issue with your device model https://github.com/Tasshack/dreame-vacuum/issues/new?assignees=Tasshack&labels=bug&template=bug_report.md&title=Map%20data%20decryption%20failed"
                 )
             else:
-                _LOGGER.error("Map data decompression failed: %s\n%s", ex, raw_data)
+                _LOGGER.error("Map data decompression failed: %s", ex)
             return None
 
         partial_map = MapDataPartial()

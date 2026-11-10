@@ -229,3 +229,73 @@ CHARGE (`siid=3`, `aiid=1`, no input parameters). Like Pause, it cancels an
 unfinished state refresh. It does not call upstream `return_to_base()`, issue
 ancillary writes, or retry. Docking acceptance must be verified separately on
 the target robot; a successful action reply alone does not establish arrival.
+
+## Native local candidate (local.9)
+
+This mode is for the stock D10s Pro (`dreame.vacuum.r2250`). It needs the
+matching candidate owner, relay and HTTPS bridge. In Home Assistant, open the
+existing **Local MQTT Bridge** entry, choose **Reconfigure**, re-enter its
+connection settings including the certificate fingerprint and choose **Local
+candidate (native controls and settings)** under **Read mode**. Network
+bridges require pinned HTTPS. Saving reloads the same entry. This opt-in
+keeps the existing entry, device, vacuum and battery registry identities.
+Existing passive state and status sensors continue recording separately with
+candidate provenance. PoC Start, Pause and Return to dock buttons and
+manual-refresh sensors are disabled in the registry so their history and
+identity remain available for rollback. Reconfigure to the previous mode to
+restore PoC entities that this mode disabled. Manually disabled entities stay
+disabled.
+
+Candidate state comes from authenticated push snapshots and bounded
+`get_properties` batches. The coordinator checks bridge state every three
+seconds while the entry has listeners, targets core fields every 12 seconds,
+and rotates the remaining model fields. Missing properties are unavailable.
+Core observations expire after 25 seconds and other observations after 150
+seconds if reads and push changes fail to refresh them. Session loss discards
+live properties and maps. The robot's stored schedule and configuration
+return through read-back after reconnect. A prior map can be absent until the
+robot supplies a usable frame or saved object.
+
+Normal Home Assistant services work in dashboards and automations with their
+usual entity permissions. The bridge validates the model-specific MIoT
+address, payload, request identity and session independently. User commands
+wait for robot application acknowledgement. State follows reports and reads
+instead of a successful HTTP response or MQTT PUBACK. An ambiguous mutation
+does not replay on timeout or reconnect. Automated device maintenance has
+only property reads and the map manager's bounded read-only frame requests.
+Startup and reconnect cannot send cleaning, docking or settings commands.
+The vendor account path and upstream cloud discovery are disabled for this
+mode.
+
+| Feature | Candidate path | Evidence and acceptance |
+| --- | --- | --- |
+| Start/resume, Pause, Stop, Return to dock, Locate | Native vacuum services. Manual mapping, fast mapping and clear warning use native buttons where applicable. | Start, dock failure and typed command dispatch exercised offline. Stock PoC previously proved Start, Pause and docking via legacy buttons. Native candidate needs live acceptance. |
+| State, status, task status, charging, error, battery and job metrics | Native sensors, vacuum activity, charging and problem binary sensors. Zero battery stays zero. Individual readings can expire or disappear. | Offline startup, push, missing field and reconnect cases covered. |
+| Cleaning and device settings | Native suction and fan, cleaning mode, water volume, sound volume, child lock, resume, carpet boost and sensitivity, obstacle avoidance, map customization, multi-floor and other r2250 settings when discovered and supported by the bridge. | Offline volume set and read-back plus firmware-gated discovery. Unknown or unsupported fields do not create writable entities. |
+| Consumables and totals | Native brush, filter, sensor and mop counters and reset actions where reported; maintenance binary sensor, cleaning totals and job statistics. | Offline discovery and native model mapping. Live availability depends on property responses. |
+| Do Not Disturb and schedules | Native DnD switch and start/end times. Optional DnD task table; native schedule table is visible in vacuum attributes. `vacuum_set_schedule`, `vacuum_delete_scheduled_task`, `vacuum_set_dnd_tasks` and `vacuum_delete_dnd_task` use the local registry. | Offline DnD clock and schedule set/delete payloads. Robot scheduling behavior needs live acceptance. |
+| Maps, room/zone/spot and restrictions | Native camera and map decoder, room/zone/spot services, Go to, mapping, saved-map selection and edits, walls and restricted areas. Native room and map entities follow decoded map data. | Synthetic frame rendering and native parameterized cleaning requests covered. An empty map is normal until a usable robot map arrives. |
+| Multiple maps, recovery and cleaning history | Bridge object exchange feeds the native renderer and stored history event parser. A scoped robot-local download URL serves a previously uploaded recovery archive when the robot reports support. | Offline protocol and decoder coverage. Live stock uploads, reports, grants, saved-map operations, and history need acceptance. |
+| Obstacle pictures | The native picture and app-display settings appear when represented in the robot's AI settings. The isolated category-3 upload lane can render received obstacle JPEGs on the map and in history. | Synthetic bridge and decoder tests. The installed firmware's picture gate and stock upload/reference exchange still need acceptance. |
+| Outside candidate | Vendor account services, firmware update, arbitrary raw commands, camera streaming, explicit camera photos and AI diagnostic uploads are excluded. Dock and other hardware features are exposed only when the model and its reported properties support them. | No fallback endpoint. |
+
+Go to on this model uses Tasshack's small-zone travel command and requires a
+current map, robot position, and observed cleaning settings. An acknowledged
+Go to starts a three-minute continuation for that session. A newer map
+frame at the target triggers one Stop while the zone task is active. On
+timeout it stops only if that same zone task is still active. The integration
+restores a temporary setting only when a later read confirms the value it
+set. Other movement commands, session loss and unload cancel the continuation.
+An interrupted trip may leave its temporary settings in place.
+
+The candidate never enables obstacle-picture settings by itself. Changing
+the app-display setting explicitly does not establish that a particular
+firmware will emit a local upload. The recovered firmware's `pic_upload`
+configuration starts disabled. Camera streaming and vendor diagnostics
+remain unavailable in candidate mode.
+
+The offline HA tests use a fake loopback bridge with vendor protocol
+construction forbidden. On the test Mac, Camera's Home Assistant dependency
+requires `PyTurboJPEG` from `tests/requirements.txt` and
+`DYLD_LIBRARY_PATH=/opt/homebrew/lib` for the local library. Deployment and
+physical tests require a separately agreed supervised scope.

@@ -5,6 +5,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.typing import ConfigType
 import logging
 import warnings
@@ -42,6 +43,7 @@ from .local_bridge import (
     LocalBridgeCoordinator,
     async_register_local_read,
     is_local_bridge,
+    is_local_candidate,
 )
 
 PLATFORMS = (
@@ -72,10 +74,41 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     return True
 
 
+def _archive_poc_entities(hass: HomeAssistant, entry: ConfigEntry, candidate: bool) -> None:
+    """Retire PoC controls and snapshots while preserving their recorder IDs."""
+    registry = er.async_get(hass)
+    archived_keys = {"local_start", "local_pause", "local_dock", "local_state_refresh", "local_state_refresh_run"}
+    unique_ids = {f"{entry.entry_id}_{key}" for key in archived_keys}
+    for entity in er.async_entries_for_config_entry(registry, entry.entry_id):
+        if entity.unique_id not in unique_ids:
+            continue
+        if candidate and entity.disabled_by is None:
+            registry.async_update_entity(entity.entity_id, disabled_by=er.RegistryEntryDisabler.INTEGRATION)
+        elif not candidate and entity.disabled_by is er.RegistryEntryDisabler.INTEGRATION:
+            registry.async_update_entity(entity.entity_id, disabled_by=None)
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Dreame Vacuum from a config entry."""
 
+    if is_local_candidate(entry.data):
+        from .local_candidate import LocalCandidateCoordinator
+
+        coordinator = LocalCandidateCoordinator(hass, entry)
+        try:
+            await coordinator.async_config_entry_first_refresh()
+            hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
+            await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+        except BaseException:
+            if coordinator.device is not None:
+                await coordinator.async_close()
+            hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
+            raise
+        _archive_poc_entities(hass, entry, candidate=True)
+        return True
+
     if is_local_bridge(entry.data):
+        _archive_poc_entities(hass, entry, candidate=False)
         coordinator = LocalBridgeCoordinator(hass, entry)
         try:
             await coordinator.async_config_entry_first_refresh()
@@ -104,9 +137,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload Dreame Vacuum config entry."""
-    if is_local_bridge(entry.data):
-        coordinators = hass.data[DOMAIN]
-        coordinator: LocalBridgeCoordinator = coordinators[entry.entry_id]
+    coordinators = hass.data[DOMAIN]
+    coordinator = coordinators[entry.entry_id]
+    if coordinator.device._local_candidate:
+        if not await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
+            return False
+        coordinators.pop(entry.entry_id)
+        await coordinator.async_close()
+        return True
+
+    if isinstance(coordinator, LocalBridgeCoordinator):
         coordinator.async_cancel_refresh()
         await coordinator.async_cancel_refresh_run("entry_unloaded")
         if not await hass.config_entries.async_unload_platforms(entry, LOCAL_BRIDGE_PLATFORMS):

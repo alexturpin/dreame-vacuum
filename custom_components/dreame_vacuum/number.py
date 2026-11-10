@@ -26,7 +26,7 @@ from .coordinator import DreameVacuumDataUpdateCoordinator
 from .entity import (
     DreameVacuumEntity,
     DreameVacuumEntityDescription,
-    remove_entities,
+    setup_native_entities,
 )
 from .dreame import DreameVacuumProperty, EntityUnavailableException, InvalidActionException
 
@@ -234,11 +234,8 @@ async def async_setup_entry(
     """Set up Dreame Vacuum number based on a config entry."""
     coordinator: DreameVacuumDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
 
-    remove_entities(hass, entry, coordinator, "number", NUMBERS)
-    async_add_entities(
-        DreameVacuumNumberEntity(coordinator, description)
-        for description in NUMBERS
-        if description.exists_fn(description, coordinator.device)
+    setup_native_entities(
+        hass, entry, coordinator, "number", NUMBERS, DreameVacuumNumberEntity, async_add_entities
     )
 
     update_segment_numbers = partial(async_update_segment_numbers, coordinator, {}, async_add_entities)
@@ -268,7 +265,8 @@ def async_update_segment_numbers(
     new_ids = set(new_ids)
     current_ids = set(k for k in current if k != "init")
 
-    async_remove_segment_numbers(coordinator, current, new_ids, visible_new_ids)
+    if not coordinator.device._local_candidate:
+        async_remove_segment_numbers(coordinator, current, new_ids, visible_new_ids)
 
     new_entities = []
     

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import asdict, dataclass
+import json
 from functools import partial
 
 import voluptuous as vol
@@ -7,9 +9,8 @@ from typing import Final
 
 from .coordinator import DreameVacuumDataUpdateCoordinator
 from .entity import DreameVacuumEntity
-from .local_bridge import LocalBridgeCoordinator, LocalBridgeEntity, bridge_state, is_local_bridge
+from .local_bridge import LocalBridgeCoordinator, LocalBridgeEntity, bridge_state, is_local_bridge, is_local_candidate
 
-from dataclasses import dataclass
 from homeassistant.helpers.importlib import async_import_module
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -37,6 +38,7 @@ from .dreame import (
     ATTR_NAME,
     DreameVacuumState,
     DreameVacuumSuctionLevel,
+    DreameVacuumProperty,
     DreameVacuumAction,
     InvalidActionException,
     UnavailableException,
@@ -151,6 +153,19 @@ CONSUMABLE_RESET_ACTION = {
 }
 
 
+_CANDIDATE_SERVICES = {
+    "vacuum_request_map", "vacuum_select_map", "vacuum_delete_map",
+    "vacuum_save_temporary_map", "vacuum_discard_temporary_map", "vacuum_replace_temporary_map",
+    "vacuum_clean_zone", "vacuum_clean_segment", "vacuum_clean_spot", "vacuum_goto", "vacuum_set_restricted_zone",
+    "vacuum_remote_control_move_step", "vacuum_rename_map", "vacuum_backup_map",
+    "vacuum_restore_map", "vacuum_merge_segments", "vacuum_split_segments",
+    "vacuum_rename_segment", "vacuum_set_cleaning_sequence", "vacuum_set_custom_cleaning",
+    "vacuum_set_segment_type", "vacuum_set_floor_material", "vacuum_set_walls",
+    "vacuum_set_obstacle_ignore", "vacuum_reset_consumable",
+    "vacuum_set_schedule", "vacuum_set_dnd_tasks", "vacuum_delete_scheduled_task", "vacuum_delete_dnd_task",
+}
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -161,15 +176,18 @@ async def async_setup_entry(
     # VacuumActivity is only available in newer Home Assistant releases.
     module = await async_import_module(hass, "homeassistant.components.vacuum")
     activity_class = getattr(module, "VacuumActivity", None)
-    if is_local_bridge(entry.data):
+    if is_local_bridge(entry.data) and not is_local_candidate(entry.data):
         async_add_entities([LocalBridgeVacuum(coordinator, activity_class)])
         return
 
     platform = entity_platform.current_platform.get()
-    # Legacy services are shared across entries. Read-only entities advertise no features.
-    register_entity_service = partial(
-        platform.async_register_entity_service, required_features=[VacuumEntityFeature.SEND_COMMAND]
-    )
+    # Entity services are shared across entries. The PoC vacuum advertises no features.
+    def register_entity_service(name, schema, method):
+        if is_local_candidate(entry.data) and name not in _CANDIDATE_SERVICES:
+            return
+        platform.async_register_entity_service(
+            name, schema, method, required_features=[VacuumEntityFeature.SEND_COMMAND]
+        )
 
     register_entity_service(
         "vacuum_request_map",
@@ -927,6 +945,30 @@ async def async_setup_entry(
         DreameVacuum.async_call_action.__name__,
     )
 
+    if is_local_candidate(entry.data):
+        register_entity_service(
+            "vacuum_set_schedule", {vol.Required("schedule"): cv.string}, "async_set_schedule"
+        )
+        register_entity_service(
+            "vacuum_set_dnd_tasks",
+            {vol.Required("tasks"): [vol.Schema({
+                vol.Required("id"): cv.positive_int,
+                vol.Required("en"): cv.boolean,
+                vol.Required("st"): cv.string,
+                vol.Required("et"): cv.string,
+                vol.Required("wk"): vol.All(vol.Coerce(int), vol.Range(min=0, max=127)),
+                vol.Required("ss"): vol.All(vol.Coerce(int), vol.Range(min=-1, max=255)),
+            })]},
+            "async_set_dnd_tasks",
+        )
+        register_entity_service(
+            "vacuum_delete_scheduled_task", {vol.Required("schedule_id"): cv.positive_int},
+            "async_delete_scheduled_task",
+        )
+        register_entity_service(
+            "vacuum_delete_dnd_task", {vol.Required("dnd_id"): cv.positive_int},
+            "async_delete_dnd_task",
+        )
     async_add_entities([DreameVacuum(coordinator, activity_class)])
 
 
@@ -945,7 +987,7 @@ class DreameVacuum(DreameVacuumEntity, StateVacuumEntity):
         )
         self._attr_has_entity_name = False
         self._attr_translation_key = DOMAIN
-        self._attr_unique_id = f"{coordinator.device.mac}_" + DOMAIN
+        self._attr_unique_id = f"{coordinator.device.mac}_{'vacuum' if self.device._local_candidate else DOMAIN}"
         self.entity_id = async_generate_entity_id(ENTITY_ID_FORMAT, f"{self.device.name}", hass=self.coordinator.hass)
         self._attr_supported_features = (
             VacuumEntityFeature.SEND_COMMAND
@@ -1027,6 +1069,7 @@ class DreameVacuum(DreameVacuumEntity, StateVacuumEntity):
                 )
             )
             and not self.device.status.suction_unavailable
+            and (not self.device._local_candidate or self.device.get_property(DreameVacuumProperty.SUCTION_LEVEL) is not None)
         ):
             self._attr_supported_features = self._attr_supported_features | VacuumEntityFeature.FAN_SPEED
             self._attr_fan_speed = self.device.status.suction_level.name.lower().replace("quiet", "silent")
@@ -1036,6 +1079,8 @@ class DreameVacuum(DreameVacuumEntity, StateVacuumEntity):
                 if level != DreameVacuumSuctionLevel.UNKNOWN
             ]
         else:
+            if self.device._local_candidate:
+                self._attr_supported_features &= ~VacuumEntityFeature.FAN_SPEED
             self._attr_fan_speed = None
             self._attr_fan_speed_list = []
 
@@ -1048,6 +1093,12 @@ class DreameVacuum(DreameVacuumEntity, StateVacuumEntity):
         if self._activity_class is None:
             self._attr_state = self._vacuum_state
         attributes = self.device.status.attributes
+        if self.device._local_candidate:
+            if self.device.get_property(DreameVacuumProperty.BATTERY_LEVEL) is None:
+                attributes.pop("battery", None)
+                attributes.pop("battery_level", None)
+            if self.device.get_property(DreameVacuumProperty.SCHEDULE) is not None:
+                attributes["schedule"] = [asdict(task) for task in self.device.status.schedule]
 
         if attributes.get(ATTR_SELECTED_MAP) is not None:
             attributes[ATTR_SELECTED_MAP] = self._localize_map_name(self.device.status.selected_map)
@@ -1093,7 +1144,9 @@ class DreameVacuum(DreameVacuumEntity, StateVacuumEntity):
     @property
     def available(self) -> bool:
         """Return True if entity is available."""
-        return self._attr_available and self.device.device_connected
+        return self._attr_available and self.device.device_connected and (
+            not self.device._local_candidate or self.device.status.state is not DreameVacuumState.UNKNOWN
+        )
 
     async def async_locate(self, **kwargs) -> None:
         """Locate the vacuum cleaner."""
@@ -1206,6 +1259,12 @@ class DreameVacuum(DreameVacuumEntity, StateVacuumEntity):
     async def async_goto(self, x, y) -> None:
         """Go to a point and take pictures around."""
         if x is not None and y is not None and x != "" and y != "":
+            if self.device._local_candidate:
+                try:
+                    await self.coordinator.async_go_to(x, y)
+                except InvalidActionException as exc:
+                    self._raise_error(exc)
+                return
             await self._try_command("Unable to call go_to: %s", self.device.go_to, x, y)
 
     async def async_follow_path(self, points="") -> None:
@@ -1358,11 +1417,15 @@ class DreameVacuum(DreameVacuumEntity, StateVacuumEntity):
 
     async def async_set_property(self, key, value=None, params=None) -> None:
         """Set property."""
+        if self.device._local_candidate:
+            self._raise_error(UnavailableException(action="set_property"))
         if key is not None and value is not None and key != "" and value != "":
             await self._try_command("set_property failed: %s", self.device.set_property_value, key, value, params)
 
     async def async_call_action(self, key, value=None) -> None:
         """Call action."""
+        if self.device._local_candidate:
+            self._raise_error(UnavailableException(action="call_action"))
         if key is not None and key != "":
             await self._try_command("call_action failed: %s", self.device.call_action_value, key, value)
 
@@ -1529,6 +1592,8 @@ class DreameVacuum(DreameVacuumEntity, StateVacuumEntity):
         map_id=None,
     ) -> None:
         """Set floor material"""
+        if self.device._local_candidate and not self.device.capability.floor_material_edit:
+            self._raise_error(UnavailableException(action="set_floor_material"))
         if material != "" and material is not None:
             await self._try_command(
                 "Unable to call set_floor_material: %s", self.device.set_floor_material, material, map_id
@@ -1581,6 +1646,25 @@ class DreameVacuum(DreameVacuumEntity, StateVacuumEntity):
     async def async_send_command(self, command: str, params=None, **kwargs) -> None:
         """Send a command to a vacuum cleaner."""
         await self._try_command("Unable to call send_command: %s", self.device.send_command, command, params)
+
+    async def async_set_schedule(self, schedule: str) -> None:
+        """Replace the robot's native schedule table."""
+        await self._try_command(
+            "Unable to update schedule: %s", self.device.set_property, DreameVacuumProperty.SCHEDULE, schedule,
+        )
+
+    async def async_set_dnd_tasks(self, tasks: list[dict]) -> None:
+        """Replace the robot's native Do Not Disturb table."""
+        await self._try_command(
+            "Unable to update DnD tasks: %s", self.device.set_property, DreameVacuumProperty.DND_TASK,
+            json.dumps(tasks, separators=(",", ":")),
+        )
+
+    async def async_delete_scheduled_task(self, schedule_id: int) -> None:
+        await self._try_command("Unable to delete scheduled task: %s", self.device.delete_scheduled_task, schedule_id)
+
+    async def async_delete_dnd_task(self, dnd_id: int) -> None:
+        await self._try_command("Unable to delete DnD task: %s", self.device.delete_dnd_task, dnd_id)
 
     async def async_reset_consumable(self, consumable: str) -> None:
         """Reset consumable"""

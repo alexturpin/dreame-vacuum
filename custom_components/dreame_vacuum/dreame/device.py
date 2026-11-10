@@ -339,6 +339,7 @@ class DreameVacuumDevice:
         auth_key: str = None,
         *,
         local_bridge: bool = False,
+        local_candidate_protocol=None,
     ) -> None:
         # Used for easy filtering the device from cloud device list and generating unique ids
         self.info = None
@@ -389,6 +390,10 @@ class DreameVacuumDevice:
         self._restore_timeout = 15
 
         self._local_bridge = local_bridge
+        self._local_candidate = local_candidate_protocol is not None
+        if self._local_candidate:
+            self._dirty_ai_data = {}
+        self._candidate_observed: set[int] = set()
         self._name = name
         self.mac = mac
         self.token = token
@@ -516,6 +521,15 @@ class DreameVacuumDevice:
         #    DreameVacuumProperty.CLEANING_PROGRESS_INFO,
         # )
 
+        if self._local_candidate:
+            from .local_map import DreameLocalMapManager
+
+            self.info = DreameVacuumDeviceInfo({"model": "dreame.vacuum.r2250"})
+            self._protocol = local_candidate_protocol
+            self._map_manager = DreameLocalMapManager(self._protocol)
+            self._map_manager.listen(self._map_changed, self._map_updated)
+            return
+
         self._protocol = DreameVacuumProtocol(
             self.host,
             self.token,
@@ -552,6 +566,54 @@ class DreameVacuumDevice:
         self.data.clear()
         self.data.update(properties)
         self.available = bool(self.data)
+
+    def apply_local_candidate_properties(self, rows, current_dids, reset, history, map_reports, timezone) -> None:
+        """Apply observations without entering the upstream cloud/poll lifecycle."""
+        if not self._local_candidate:
+            raise RuntimeError("Local candidate protocol required")
+        if reset:
+            self._map_manager.reset_session()
+            self._dirty_data.clear()
+            self._dirty_auto_switch_data.clear()
+            self._dirty_ai_data.clear()
+        active = {int(did) for did in current_dids}
+        expired = set(self.data) - active
+        for did in expired:
+            self.data.pop(did)
+        for prop, attr, fallback in (
+            (DreameVacuumProperty.CLEANING_MODE, "cleaning_mode", None),
+            (DreameVacuumProperty.DND_TASK, "dnd_tasks", None),
+            (DreameVacuumProperty.SCHEDULE, "schedule", []),
+            (DreameVacuumProperty.FAULTS, "faults", []),
+            (DreameVacuumProperty.OFF_PEAK_CHARGING, "off_peak_charging_config", None),
+        ):
+            if prop.value in expired:
+                setattr(self.status, attr, fallback)
+        if DreameVacuumProperty.AUTO_SWITCH_SETTINGS.value in expired:
+            self.auto_switch_data = None
+        if DreameVacuumProperty.AI_OBSTACLE_DETECTION.value in expired:
+            self.ai_data = None
+        discovered = active - self._candidate_observed
+        if discovered:
+            self._candidate_observed.update(discovered)
+            # Several model capabilities depend on which properties actually exist.
+            self.capability = DreameVacuumDeviceCapability(self)
+        self.available = self._protocol.connected and bool(active)
+        if rows:
+            self._handle_properties([row for row in rows if int(row["did"]) in active])
+            self._ready = True
+        if self._protocol.connected:
+            self._map_manager.set_device_running(self.status.running, self.status.docked)
+            if rows:
+                self._map_manager.ingest_properties(rows)
+            for report in map_reports:
+                self._map_manager.ingest_properties(report)
+            self._map_manager.update()
+        if history is not None:
+            self.status._cleaning_history = self._map_manager.parse_history(history, self.property_mapping)
+            self.status._cleaning_history_attrs = None
+            records = self.status._cleaning_history
+            self.status._last_cleaning_time = records[0].date.astimezone(timezone) if records else None
 
     def _require_writable_protocol(self) -> None:
         if self._local_bridge:
@@ -662,7 +724,7 @@ class DreameVacuumDevice:
                         or did == DreameVacuumProperty.RECOVERY_MAP_LIST.value
                         or did == DreameVacuumProperty.SERIAL_NUMBER.value
                     )
-                    if not custom_property:
+                    if not custom_property and not self._local_candidate:
                         if current_value is not None:
                             _LOGGER.info(
                                 "Property %s Changed: %s -> %s",
@@ -679,7 +741,7 @@ class DreameVacuumDevice:
                     self.data[did] = value
                     if did in self._property_update_callback:
                         for callback in self._property_update_callback[did]:
-                            if not self._ready and custom_property:
+                            if not self._ready and custom_property and not self._local_candidate:
                                 callback(current_value)
                             else:
                                 callbacks.append([callback, current_value])
@@ -691,8 +753,14 @@ class DreameVacuumDevice:
             if self._map_manager:
                 self._map_manager.set_capability(self.capability)
 
-        for callback in callbacks:
-            callback[0](callback[1])
+        for callback, previous in callbacks:
+            if self._local_candidate:
+                try:
+                    callback(previous)
+                except (ValueError, TypeError, KeyError, IndexError, AttributeError):
+                    _LOGGER.debug("Unable to decode a local model property with %s", callback)
+            else:
+                callback(previous)
 
         if changed:
             self._last_change = time.time()
@@ -849,13 +917,14 @@ class DreameVacuumDevice:
                         capabilities.append(p.upper())
             _LOGGER.info("Capabilities: %s", ", ".join(capabilities))
 
-            self.reload_shortcuts(True)
+            if not self._local_candidate:
+                self.reload_shortcuts(True)
 
         return changed
 
     def _request_properties(self, properties: list[DreameVacuumProperty] = None) -> bool:
         """Request properties from the device."""
-        if self._local_bridge:
+        if self._local_bridge or self._local_candidate:
             return False
         if not properties:
             properties = self._default_properties
@@ -937,12 +1006,16 @@ class DreameVacuumDevice:
 
         for prop, value in props.items():
             changed = self._update_property(prop, value) or changed
-        if changed:
+        if changed and self._update_callback:
             self._update_callback()
 
     def _update_property(self, prop: DreameVacuumProperty, value: Any, delay=True) -> Any:
         """Update device property on memory and notify listeners."""
         self._require_writable_protocol()
+        if self._local_candidate:
+            # Native commands use optimistic cache writes to paint previews. The
+            # local candidate shows state from reports and solicited read-back.
+            return self.get_property(prop)
         if prop in self.property_mapping:
             if (
                 not self.capability.new_state
@@ -1198,6 +1271,7 @@ class DreameVacuumDevice:
                             self._previous_cleaning_mode = self.status.cleaning_mode
                             if (
                                 self._ready
+                                and not self._local_candidate
                                 and not self.status.scheduled_clean
                                 and not self.status.shortcut_task
                                 and not self.status.cleangenius_cleaning
@@ -1215,6 +1289,7 @@ class DreameVacuumDevice:
                             if not virtual_sweeping and self.status.sweeping:
                                 if (
                                     self._ready
+                                    and not self._local_candidate
                                     and not self.status.scheduled_clean
                                     and not self.status.shortcut_task
                                     and not self.status.cleangenius_cleaning
@@ -1496,7 +1571,7 @@ class DreameVacuumDevice:
             elif status == DreameVacuumStatus.CHARGING.value and previous_status == DreameVacuumStatus.BACK_HOME.value:
                 self._cleaning_history_update = time.time()
 
-            if previous_status == DreameVacuumStatus.OTA.value:
+            if not self._local_candidate and previous_status == DreameVacuumStatus.OTA.value:
                 self._ready = False
                 self.connect_device()
 
@@ -1565,6 +1640,10 @@ class DreameVacuumDevice:
     def _ai_obstacle_detection_changed(self, previous_ai_obstacle_detection: Any = None) -> None:
         """AI Detection property returns multiple values as json or int this function parses and sets the sub properties to memory"""
         ai_value = self.get_property(DreameVacuumProperty.AI_OBSTACLE_DETECTION)
+        if self._local_candidate:
+            # A typed report is authoritative. Sub-properties omitted by a
+            # new snapshot must not inherit flags from an earlier report.
+            self.ai_data = {}
         changed = False
         if isinstance(ai_value, str):
             settings = json.loads(ai_value)
@@ -2049,6 +2128,8 @@ class DreameVacuumDevice:
 
     def _property_changed(self, delay=True) -> None:
         """Call external listener when a property changed"""
+        if self._local_candidate:
+            return  # The HA coordinator publishes one consistent observation.
         if self._update_callback:
             if self._callback_timer is not None:
                 self._callback_timer.cancel()
@@ -2067,6 +2148,9 @@ class DreameVacuumDevice:
 
     def _map_changed(self, saved_map) -> None:
         """Call external listener when a map changed"""
+        if self._local_candidate:
+            self._map_updated()
+            return
         map_data = self.status.current_map
         if self._map_select_time:
             self._map_select_time = None
@@ -2662,7 +2746,7 @@ class DreameVacuumDevice:
 
     def schedule_update(self, wait: float = None, force_request_properties=False) -> None:
         """Schedule a device update for future"""
-        if self._local_bridge:
+        if self._local_bridge or self._local_candidate:
             return
         if wait == None:
             wait = self._update_interval
@@ -3050,6 +3134,9 @@ class DreameVacuumDevice:
         if isinstance(prop, DreameVacuumStrAIProperty) or isinstance(prop, DreameVacuumAIProperty):
             return self.set_ai_property(prop, value)
 
+        if self._local_candidate:
+            return self.set_properties({prop: value})
+
         self.schedule_update(10)
         current_value = self._update_property(prop, value, False)
         if current_value is not None:
@@ -3097,6 +3184,15 @@ class DreameVacuumDevice:
         """Sets multiple properties at once using the existing property mapping and notify listeners"""
         self._require_writable_protocol()
         if not properties:
+            return True
+        if self._local_candidate:
+            values = []
+            for prop, value in properties.items():
+                mapping = self.property_mapping.get(prop)
+                if mapping is None or "piid" not in mapping or self.get_property(prop) is None:
+                    raise UnavailableException(action=prop.name.lower())
+                values.append((mapping["siid"], mapping["piid"], value))
+            self._protocol.set_properties(values)
             return True
 
         self.schedule_update(10)
@@ -3869,6 +3965,27 @@ class DreameVacuumDevice:
         if "siid" not in mapping or "aiid" not in mapping:
             raise InvalidActionException(key="unknown_action", action=action)
 
+        cleaning_action = action in (
+            DreameVacuumAction.START,
+            DreameVacuumAction.START_CUSTOM,
+            DreameVacuumAction.PAUSE,
+            DreameVacuumAction.STOP,
+            DreameVacuumAction.CHARGE,
+        )
+
+        if self._local_candidate:
+            available_fn = ACTION_AVAILABILITY.get(action.name)
+            if not cleaning_action and available_fn and not available_fn(self):
+                raise UnavailableException(action=action.name.lower())
+            try:
+                return self._protocol.action(mapping["siid"], mapping["aiid"], parameters)
+            except Exception:
+                # Upstream callers perform their normal rollback when a command
+                # fails. The candidate adapter preserves the concrete RPC error.
+                if self._protocol.command is not None and self._protocol.command.failure is not None:
+                    return None
+                raise
+
         if self.status.draining_complete:
             self.set_property(DreameVacuumProperty.DRAINAGE_STATUS, 0)
 
@@ -3876,17 +3993,6 @@ class DreameVacuumDevice:
 
         if not map_action:
             self.schedule_update(10, True)
-
-        cleaning_action = bool(
-            action
-            in [
-                DreameVacuumAction.START,
-                DreameVacuumAction.START_CUSTOM,
-                DreameVacuumAction.PAUSE,
-                DreameVacuumAction.STOP,
-                DreameVacuumAction.CHARGE,
-            ]
-        )
 
         if not cleaning_action:
             available_fn = ACTION_AVAILABILITY.get(action.name)
@@ -4092,6 +4198,8 @@ class DreameVacuumDevice:
         commands which are not implemented by a given device instance. (Not likely)"""
 
         self._require_writable_protocol()
+        if self._local_candidate:
+            raise NotSupportedException(feature="send_command")
         if (
             command == "" or command in INVALID_COMMANDS
         ):  ## Commands for other vacuums are unanswered by the device, so they are rejected to prevent timeouts.
@@ -4280,15 +4388,18 @@ class DreameVacuumDevice:
         if dnd_start == dnd_end:
             raise InvalidActionException(key="invalid_value", parameter="dnd_time", value=f"{dnd_start} == {dnd_end}")
 
-        if self.status.dnd_tasks is None:
-            self.status.dnd_tasks = []
+        tasks = self.status.dnd_tasks or []
+        if self._local_candidate:
+            tasks = copy.deepcopy(tasks)
+        elif self.status.dnd_tasks is None:
+            self.status.dnd_tasks = tasks
 
-        if len(self.status.dnd_tasks) == 0:
-            self.status.dnd_tasks.append(DNDTask(1, enabled, dnd_start, dnd_end, 127, 0))
+        if len(tasks) == 0:
+            tasks.append(DNDTask(1, enabled, dnd_start, dnd_end, 127, 0))
         else:
-            self.status.dnd_tasks[0].enabled = enabled
-            self.status.dnd_tasks[0].start = dnd_start
-            self.status.dnd_tasks[0].end = dnd_end
+            tasks[0].enabled = enabled
+            tasks[0].start = dnd_start
+            tasks[0].end = dnd_end
 
         return self.set_property(
             DreameVacuumProperty.DND_TASK,
@@ -4303,7 +4414,7 @@ class DreameVacuumDevice:
                             "wk": task.repeats,
                             "ss": task.ss,
                         }
-                        for task in self.status.dnd_tasks
+                        for task in tasks
                     ],
                     separators=(",", ":"),
                 )
@@ -4554,6 +4665,8 @@ class DreameVacuumDevice:
             if self.status.task_status is DreameVacuumTaskStatus.STATION_CLEANING:
                 raise UnavailableException(key="unavailable_while_self_wash")
 
+            if self.status.battery_level is None:
+                raise UnavailableException(action="start")
             if self.status.battery_level <= self.capability.min_battery:
                 raise InvalidActionException(key="low_battery")
 
@@ -5134,6 +5247,21 @@ class DreameVacuumDevice:
             self._update_properties(properties)
             raise CommandFailedException()
         return response
+
+    def start_local_go_to(self, x, y):
+        """Run the model's zone-based travel without arming native callbacks."""
+        try:
+            return self.go_to(x, y)
+        finally:
+            self.status.go_to_zone = None
+
+    def finish_local_go_to(self, stop, restore):
+        """Stop and restore settings for an explicitly tracked local travel."""
+        if stop and not self.call_action(DreameVacuumAction.STOP):
+            raise CommandFailedException()
+        if restore:
+            self.set_properties(restore)
+        return True
 
     def go_to(self, x, y) -> dict[str, Any] | None:
         """Go to a point and take pictures around."""
@@ -6112,26 +6240,30 @@ class DreameVacuumDevice:
                 3,
             )
 
+    def _send_ai_flag(self, prop, value, current):
+        if isinstance(current, int):
+            bit = DreameVacuumAIProperty[prop.name].value
+            return self.set_ai_detection((current | bit) if value else (current & ~bit))
+        return self.set_ai_detection({DreameVacuumStrAIProperty[prop.name].value: bool(value)})
+
     def set_ai_property(
         self, prop: DreameVacuumStrAIProperty | DreameVacuumAIProperty, value: bool
     ) -> dict[str, Any] | None:
         self._require_writable_protocol()
         if self.capability.ai_detection:
-            if prop.name not in self.ai_data:
+            if not self.ai_data or prop.name not in self.ai_data:
                 raise NotSupportedException(feature="ai_property")
             current_value = self.get_ai_property(prop)
+            ai_value = self.get_property(DreameVacuumProperty.AI_OBSTACLE_DETECTION)
+            if self._local_candidate:
+                return self._send_ai_flag(prop, value, ai_value)
 
             self._dirty_ai_data[prop.name] = DirtyData(value, current_value, time.time())
             self.ai_data[prop.name] = value
-            ai_value = self.get_property(DreameVacuumProperty.AI_OBSTACLE_DETECTION)
             self._property_changed(False)
             result = None
             try:
-                if isinstance(ai_value, int):
-                    bit = DreameVacuumAIProperty[prop.name].value
-                    result = self.set_ai_detection((ai_value | bit) if value else (ai_value & -(bit + 1)))
-                else:
-                    result = self.set_ai_detection({DreameVacuumStrAIProperty[prop.name].value: bool(value)})
+                result = self._send_ai_flag(prop, value, ai_value)
 
                 if result is None or result[0]["code"] != 0:
                     _LOGGER.error(
@@ -8007,6 +8139,10 @@ class DreameVacuumDevice:
         return self._protocol.connected
 
     @property
+    def map_connected(self) -> bool:
+        return self.device_connected if self._local_candidate else self.cloud_connected
+
+    @property
     def cloud_connected(self) -> bool:
         """Return connection status of the device."""
         if self._local_bridge:
@@ -8165,7 +8301,7 @@ class DreameVacuumDeviceStatus:
     def battery_level(self) -> int | None:
         """Return battery level of the device."""
         battery_level = self._get_property(DreameVacuumProperty.BATTERY_LEVEL)
-        if self._device._local_bridge:
+        if self._device._local_bridge or self._device._local_candidate:
             return battery_level
         return int(battery_level) if battery_level else 100
 

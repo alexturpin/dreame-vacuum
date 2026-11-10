@@ -212,6 +212,7 @@
       "options": {
         "passive": "Passive telemetry only",
         "on_demand_refresh": "On-demand state refresh",
+        "local_candidate": "Local candidate (native controls and settings)",
         "durable_refresh": "Durable state refresh",
         "legacy": "Legacy individual reads",
         "state_refresh": "Bounded state refresh",

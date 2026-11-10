@@ -460,7 +460,8 @@ def async_update_map_cameras(
     current_ids = set(k for k in current if k != "init")
     new_entities = []
 
-    async_remove_map_cameras(coordinator, current, new_indexes)
+    if not coordinator.device._local_candidate:
+        async_remove_map_cameras(coordinator, current, new_indexes)
 
     for map_index in new_indexes - current_ids:
         current[map_index] = [
@@ -710,7 +711,7 @@ class DreameVacuumCameraEntity(DreameVacuumEntity, Camera):
         """Fetch state from the device."""
         self._last_map_request = 0
         map_data = self._map_data
-        if map_data and self.device.cloud_connected and (self.map_index > 0 or self.device.status.located):
+        if map_data and self.device.map_connected and (self.map_index > 0 or self.device.status.located):
             if map_data.last_updated:
                 self._state = datetime.fromtimestamp(int(map_data.last_updated))
             elif map_data.timestamp_ms:
@@ -758,7 +759,7 @@ class DreameVacuumCameraEntity(DreameVacuumEntity, Camera):
                 now = time.time()
                 if now - self._last_map_request >= self.frame_interval:
                     self._last_map_request = now
-                    if self.map_index == 0 and self.device:
+                    if self.map_index == 0 and self.device and not self.device._local_candidate:
                         self.device.update_map()
                     self.update()
                     if (
@@ -837,7 +838,7 @@ class DreameVacuumCameraEntity(DreameVacuumEntity, Camera):
 
     def update(self) -> None:
         map_data = self._map_data
-        if map_data and self.device.cloud_connected and (self.map_index > 0 or self.device.status.located):
+        if map_data and self.device.map_connected and (self.map_index > 0 or self.device.status.located):
             self._device_active = self.device.status.active
             if map_data.last_updated:
                 self._state = datetime.fromtimestamp(int(map_data.last_updated))
@@ -1113,7 +1114,7 @@ class DreameVacuumCameraEntity(DreameVacuumEntity, Camera):
 
     @property
     def _default_map_image(self) -> Any:
-        if self.device and self._image and not self.device.cloud_connected:
+        if self.device and self._image and not self.device.map_connected:
             return self._renderer.disconnected_map_image
         return self._renderer.default_map_image
 
@@ -1200,7 +1201,7 @@ class DreameVacuumCameraEntity(DreameVacuumEntity, Camera):
         if not self.map_data_json:
             if (
                 map_data
-                and self.device.cloud_connected
+                and self.device.map_connected
                 and not map_data.empty_map
                 and (self.map_index > 0 or self.device.status.located)
             ):
@@ -1255,7 +1256,7 @@ class DreameVacuumCameraEntity(DreameVacuumEntity, Camera):
                 attributes[ATTR_CALIBRATION] = (
                     self._calibration_points if self._calibration_points else self._renderer.calibration_points
                 )
-            elif self.device.cloud_connected:
+            elif self.device.map_connected:
                 attributes = {ATTR_CALIBRATION: self._renderer.default_calibration_points}
 
             if not attributes:
@@ -1373,7 +1374,7 @@ class DreameVacuumCameraEntity(DreameVacuumEntity, Camera):
                     )
         elif (
             map_data
-            and self.device.cloud_connected
+            and self.device.map_connected
             and not map_data.empty_map
             and (self.map_index > 0 or self.device.status.located)
         ):

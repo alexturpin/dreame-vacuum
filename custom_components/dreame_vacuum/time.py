@@ -20,7 +20,7 @@ from .dreame import EntityUnavailableException, InvalidActionException, Unavaila
 from .const import DOMAIN
 
 from .coordinator import DreameVacuumDataUpdateCoordinator
-from .entity import DreameVacuumEntity, DreameVacuumEntityDescription, remove_entities
+from .entity import DreameVacuumEntity, DreameVacuumEntityDescription, setup_native_entities
 
 
 @dataclass
@@ -70,11 +70,8 @@ async def async_setup_entry(
     """Set up Dreame Vacuum time based on a config entry."""
     coordinator: DreameVacuumDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
 
-    remove_entities(hass, entry, coordinator, "time", TIMES)
-    async_add_entities(
-        DreameVacuumTimeEntity(coordinator, description)
-        for description in TIMES
-        if description.exists_fn(description, coordinator.device)
+    setup_native_entities(
+        hass, entry, coordinator, "time", TIMES, DreameVacuumTimeEntity, async_add_entities
     )
 
 

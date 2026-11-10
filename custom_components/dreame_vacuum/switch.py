@@ -19,7 +19,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from .const import DOMAIN
 
 from .coordinator import DreameVacuumDataUpdateCoordinator
-from .entity import DreameVacuumEntity, DreameVacuumEntityDescription, remove_entities
+from .entity import DreameVacuumEntity, DreameVacuumEntityDescription, setup_native_entities
 from .dreame import (
     EntityUnavailableException,
     DreameVacuumProperty,
@@ -565,11 +565,8 @@ async def async_setup_entry(
     """Set up Dreame Vacuum switch based on a config entry."""
     coordinator: DreameVacuumDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
 
-    remove_entities(hass, entry, coordinator, "switch", SWITCHES)
-    async_add_entities(
-        DreameVacuumSwitchEntity(coordinator, description)
-        for description in SWITCHES
-        if description.exists_fn(description, coordinator.device)
+    setup_native_entities(
+        hass, entry, coordinator, "switch", SWITCHES, DreameVacuumSwitchEntity, async_add_entities
     )
 
 

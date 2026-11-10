@@ -63,10 +63,12 @@ READ_MODE_STATE_REFRESH = "state_refresh"
 READ_MODE_STATE_REFRESH_RUN = "state_refresh_run"
 READ_MODE_DURABLE_REFRESH = "durable_refresh"
 READ_MODE_ON_DEMAND = "on_demand_refresh"
+READ_MODE_CANDIDATE = "local_candidate"
 _RUN_MODES = (READ_MODE_STATE_REFRESH_RUN, READ_MODE_DURABLE_REFRESH, READ_MODE_ON_DEMAND)
 BRIDGE_READ_MODES = (
     READ_MODE_PASSIVE,
     READ_MODE_ON_DEMAND,
+    READ_MODE_CANDIDATE,
     READ_MODE_DURABLE_REFRESH,
     READ_MODE_LEGACY,
     READ_MODE_STATE_REFRESH,
@@ -148,6 +150,11 @@ class LocalBridgeError(HomeAssistantError):
 def is_local_bridge(data: Mapping[str, Any]) -> bool:
     """Identify local bridge entries before touching legacy configuration."""
     return data.get(CONF_ACCOUNT_TYPE) == ACCOUNT_TYPE_LOCAL_BRIDGE
+
+
+def is_local_candidate(data: Mapping[str, Any]) -> bool:
+    """Identify entries explicitly opted into native local operation."""
+    return is_local_bridge(data) and data.get(CONF_BRIDGE_READ_MODE) == READ_MODE_CANDIDATE
 
 
 def bridge_state(value: int) -> DreameVacuumState | None:
@@ -278,12 +285,15 @@ class LocalBridgeClient:
         payload: dict | None = None,
         *,
         version: int = _VERSION,
+        max_bytes: int | None = None,
+        query: dict | None = None,
     ) -> dict:
-        max_bytes = _RUN_MAX_RESPONSE_BYTES if version == _RUN_VERSION else _MAX_RESPONSE_BYTES
+        if max_bytes is None:
+            max_bytes = _RUN_MAX_RESPONSE_BYTES if version == _RUN_VERSION else _MAX_RESPONSE_BYTES
         try:
             async with self._session.request(
                 method,
-                self._url.with_path(path),
+                self._url.with_path(path).with_query(query),
                 headers=self._headers,
                 ssl=self._ssl,
                 allow_redirects=False,

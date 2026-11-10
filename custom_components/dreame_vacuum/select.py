@@ -27,7 +27,7 @@ from .coordinator import DreameVacuumDataUpdateCoordinator
 from .entity import (
     DreameVacuumEntity,
     DreameVacuumEntityDescription,
-    remove_entities,
+    setup_native_entities,
 )
 
 from .dreame import (
@@ -875,11 +875,8 @@ async def async_setup_entry(
     """Set up Dreame Vacuum select based on a config entry."""
     coordinator: DreameVacuumDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
 
-    remove_entities(hass, entry, coordinator, "select", SELECTS)
-    async_add_entities(
-        DreameVacuumSelectEntity(coordinator, description)
-        for description in SELECTS
-        if description.exists_fn(description, coordinator.device)
+    setup_native_entities(
+        hass, entry, coordinator, "select", SELECTS, DreameVacuumSelectEntity, async_add_entities
     )
     update_segment_selects = partial(async_update_segment_selects, coordinator, {}, async_add_entities)
     coordinator.async_add_listener(update_segment_selects)
@@ -908,7 +905,8 @@ def async_update_segment_selects(
     new_ids = set(new_ids)
     current_ids = set(k for k in current if k != "init")
 
-    async_remove_segment_selects(coordinator, current, new_ids, visible_new_ids)
+    if not coordinator.device._local_candidate:
+        async_remove_segment_selects(coordinator, current, new_ids, visible_new_ids)
 
     new_entities = []
 

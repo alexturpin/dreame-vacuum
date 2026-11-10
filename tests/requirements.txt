@@ -5,3 +5,4 @@ pycryptodome==4.4.0
 python-miio==0.5.12
 mini-racer==0.14.1
 paho-mqtt==2.1.0
+PyTurboJPEG==1.8.3

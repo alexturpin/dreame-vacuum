@@ -66,6 +66,7 @@ from .local_bridge import (
     LocalBridgeError,
     READ_MODE_PASSIVE,
     is_local_bridge,
+    is_local_candidate,
     validate_bridge_url,
 )
 
@@ -416,14 +417,22 @@ class DreameVacuumFlowHandler(ConfigFlow, domain=DOMAIN):
                         user_input.get(CONF_BRIDGE_READ_MODE, read_mode)
                     ),
                 }
-                bridge = LocalBridgeClient(async_get_clientsession(self.hass), data)
+                if is_local_candidate(data):
+                    from .local_candidate import CandidateBridgeClient
+
+                    bridge = CandidateBridgeClient(async_get_clientsession(self.hass), data)
+                else:
+                    bridge = LocalBridgeClient(async_get_clientsession(self.hass), data)
             except (ValueError, vol.Invalid):
                 errors["base"] = "invalid_bridge_settings"
             else:
                 if self.entry is None or data[CONF_BRIDGE_URL] != self.entry.data[CONF_BRIDGE_URL]:
                     self._async_abort_entries_match({CONF_BRIDGE_URL: data[CONF_BRIDGE_URL]})
                 try:
-                    await bridge.async_get_state()
+                    if is_local_candidate(data):
+                        await bridge.async_candidate_state()
+                    else:
+                        await bridge.async_get_state()
                 except LocalBridgeError:
                     errors["base"] = "cannot_connect_bridge"
                 else:

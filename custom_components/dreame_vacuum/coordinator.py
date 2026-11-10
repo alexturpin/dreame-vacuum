@@ -108,12 +108,13 @@ class DreameVacuumDataUpdateCoordinator(DataUpdateCoordinator[DreameVacuumDevice
         hass: HomeAssistant,
         *,
         entry: ConfigEntry,
+        device: DreameVacuumDevice | None = None,
     ) -> None:
         """Initialize global Dreame Vacuum data updater."""
         self._unsub_dispatcher = None
         self._device: DreameVacuumDevice = None
-        self._token = entry.data[CONF_TOKEN]
-        self._host = entry.data[CONF_HOST]
+        self._token = entry.data[CONF_TOKEN] if device is None else None
+        self._host = entry.data[CONF_HOST] if device is None else None
         self._notify = entry.options.get(CONF_NOTIFY, True)
         self._auth_key = entry.data.get(CONF_AUTH_KEY)
         self._entry = entry
@@ -127,7 +128,7 @@ class DreameVacuumDataUpdateCoordinator(DataUpdateCoordinator[DreameVacuumDevice
 
         LOGGER.info("Integration loading: %s", entry.data[CONF_NAME])
 
-        if entry.options.get(CONF_VERSION) != VERSION:
+        if device is None and entry.options.get(CONF_VERSION) != VERSION:
             options = entry.options.copy()
 
             ## Migration: Convert map objects to hidden map objects
@@ -161,7 +162,7 @@ class DreameVacuumDataUpdateCoordinator(DataUpdateCoordinator[DreameVacuumDevice
             options[CONF_VERSION] = VERSION
             hass.config_entries.async_update_entry(entry=entry, options=options)
 
-        self._device = DreameVacuumDevice(
+        self._device = device or DreameVacuumDevice(
             entry.data[CONF_NAME],
             self._host,
             self._token,
@@ -292,11 +293,12 @@ class DreameVacuumDataUpdateCoordinator(DataUpdateCoordinator[DreameVacuumDevice
 
         super().__init__(hass, LOGGER, name=DOMAIN)
 
-        self._unsub_dispatcher = async_dispatcher_connect(
-            hass,
-            persistent_notification.SIGNAL_PERSISTENT_NOTIFICATIONS_UPDATED,
-            self._notification_dismiss_listener,
-        )
+        if device is None:
+            self._unsub_dispatcher = async_dispatcher_connect(
+                hass,
+                persistent_notification.SIGNAL_PERSISTENT_NOTIFICATIONS_UPDATED,
+                self._notification_dismiss_listener,
+            )
 
     async def async_load_locale(self, hass) -> None:
         def load_locale(language: str) -> dict:
@@ -556,7 +558,9 @@ class DreameVacuumDataUpdateCoordinator(DataUpdateCoordinator[DreameVacuumDevice
                     self._drainage_status = self._device.status.draining_complete
 
     def _fire_event(self, event_id, data) -> None:
-        entity_id = er.async_get(self.hass).async_get_entity_id("vacuum", DOMAIN, f"{self._device.mac}_{DOMAIN}")
+        entity_id = er.async_get(self.hass).async_get_entity_id(
+            "vacuum", DOMAIN, f"{self._device.mac}_{'vacuum' if self._device._local_candidate else DOMAIN}"
+        )
         if entity_id is None:
             entity_id = generate_entity_id("vacuum.{}", self._device.name, hass=self.hass)
         event_data = {ATTR_ENTITY_ID: entity_id}

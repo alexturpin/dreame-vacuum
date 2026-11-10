@@ -20,10 +20,10 @@ from homeassistant.helpers.entity import EntityCategory, async_generate_entity_i
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers import entity_registry
 from .const import DOMAIN
-from .local_bridge import LocalBridgeEntity, READ_MODE_ON_DEMAND, is_local_bridge
+from .local_bridge import LocalBridgeEntity, READ_MODE_ON_DEMAND, is_local_bridge, is_local_candidate
 
 from .coordinator import DreameVacuumDataUpdateCoordinator
-from .entity import DreameVacuumEntity, DreameVacuumEntityDescription, remove_entities
+from .entity import DreameVacuumEntity, DreameVacuumEntityDescription, setup_native_entities
 from .dreame import DreameVacuumAction, EntityUnavailableException
 
 
@@ -319,18 +319,15 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up Dreame Vacuum Button based on a config entry."""
-    if is_local_bridge(entry.data):
+    if is_local_bridge(entry.data) and not is_local_candidate(entry.data):
         coordinator = hass.data[DOMAIN][entry.entry_id]
         if coordinator._read_mode == READ_MODE_ON_DEMAND:
             async_add_entities([LocalBridgeControlButton(coordinator, action) for action in ("start", "pause", "dock")])
         return
     coordinator: DreameVacuumDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
 
-    remove_entities(hass, entry, coordinator, "button", BUTTONS)
-    async_add_entities(
-        DreameVacuumButtonEntity(coordinator, description)
-        for description in BUTTONS
-        if description.exists_fn(description, coordinator.device)
+    setup_native_entities(
+        hass, entry, coordinator, "button", BUTTONS, DreameVacuumButtonEntity, async_add_entities
     )
 
     if coordinator.device.capability.shortcuts:

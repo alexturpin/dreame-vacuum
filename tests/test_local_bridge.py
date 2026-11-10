@@ -1922,3 +1922,370 @@ async def test_local_controls_reject_internal_automated_and_non_admin_calls(hass
             await coordinator.async_control("start", context)
     assert not run_bridge.actions
     assert not run_bridge.posts
+
+
+@dataclass
+class FakeCandidateBridge(FakeBridge):
+    """Serve the independently shaped candidate API on loopback only."""
+
+    reported: dict = field(default_factory=dict)
+    epoch: str | None = _EPOCH
+    rpc_error: str | None = None
+    fail_reads: bool = False
+    rpc_out: list[dict] = field(default_factory=list)
+    sequence: int = 0
+    push: list[dict] = field(default_factory=list)
+    map_reports: list[dict] = field(default_factory=list)
+    history: list[dict] = field(default_factory=list)
+
+    async def candidate_state(self, request):
+        assert request.headers["Authorization"] == f"Bearer {self.token}"
+        return web.json_response({
+            "version": 1, "epoch": self.epoch, "connected": self.epoch is not None,
+            "ready": self.epoch is not None,
+            "sequence": self.sequence, "properties": self.push,
+            "history": self.history, "map_reports": self.map_reports,
+        })
+
+    async def rpc(self, request):
+        assert request.headers["Authorization"] == f"Bearer {self.token}"
+        data = await request.json()
+        self.posts.append(data)
+        identity = {key: data[key] for key in ("version", "epoch", "request_id")}
+        assert data["epoch"] == self.epoch
+        if data["method"] == "get_properties":
+            if self.fail_reads:
+                return web.json_response(identity | {"error": "timeout"})
+            assert 0 < len(data["params"]) <= 15
+            return web.json_response(identity | {"result": [
+                {**item, "code": 0, "value": self.reported[item["did"]]}
+                for item in data["params"] if item["did"] in self.reported
+            ]})
+        if self.rpc_error is not None:
+            return web.json_response(identity | {"error": self.rpc_error})
+        if data["method"] == "set_properties":
+            return web.json_response(identity | {"result": [
+                {key: item[key] for key in ("did", "siid", "piid")} | {"code": 0}
+                for item in data["params"]
+            ]})
+        if data["method"] == "action":
+            params = data["params"]
+            return web.json_response(identity | {"result": {
+                key: params[key] for key in ("did", "siid", "aiid")
+            } | {"code": 0, "out": self.rpc_out}})
+        raise AssertionError(f"Unexpected method {data['method']}")
+
+
+@pytest.fixture
+async def candidate_bridge(aiohttp_server, socket_enabled):
+    bridge = FakeCandidateBridge(
+        state=_state(_property("0", 2, 2), _property("2", 3, 42), sequence=1),
+        reported={
+            "0": 2, "1": 0, "2": 42, "3": 2, "5": 14, "8": 1, "9": 1, "10": 0,
+            "11": 0, "27": 0, "31": False, "72": True, "73": "22:00", "74": "08:00",
+            "91": 40, "114": "1-1-12:30-1111111-1-0-1-1-0", "120": 82,
+        },
+    )
+    app = web.Application()
+    app.router.add_get("/v1/state", bridge.get_state)
+    app.router.add_get("/v1/candidate/state", bridge.candidate_state)
+    app.router.add_post("/v1/rpc", bridge.rpc)
+    server = await aiohttp_server(app)
+    bridge.url = str(server.make_url("/").origin())
+    return bridge
+
+
+async def test_candidate_reconfigure_preserves_registry_and_uses_native_entities(hass, candidate_bridge):
+    entry, _ = await _load_entry(hass, candidate_bridge)
+    registry = er.async_get(hass)
+    vacuum_id = registry.async_get(_VACUUM).id
+    battery_id = registry.async_get(_BATTERY).id
+    retired = registry.async_get_or_create("button", DOMAIN, f"{entry.entry_id}_local_start", config_entry=entry)
+    user_disabled = registry.async_get_or_create(
+        "button", DOMAIN, f"{entry.entry_id}_local_dock", config_entry=entry,
+        disabled_by=er.RegistryEntryDisabler.USER,
+    )
+    passive = registry.async_get_or_create("sensor", DOMAIN, f"{entry.entry_id}_local_passive_state", config_entry=entry)
+    flow = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_RECONFIGURE, "entry_id": entry.entry_id}
+    )
+    result = await _configure(hass, candidate_bridge, flow["flow_id"], bridge_read_mode="local_candidate")
+    assert result["type"] is FlowResultType.ABORT
+    await hass.async_block_till_done()
+    assert entry.state is ConfigEntryState.LOADED
+    assert registry.async_get(_VACUUM).id == vacuum_id
+    assert registry.async_get(_BATTERY).id == battery_id
+    assert registry.async_get(retired.entity_id).disabled_by is er.RegistryEntryDisabler.INTEGRATION
+    assert registry.async_get(user_disabled.entity_id).disabled_by is er.RegistryEntryDisabler.USER
+    assert registry.async_get(passive.entity_id).id == passive.id
+    assert hass.states.get(passive.entity_id).attributes["provenance"] == "candidate"
+    assert hass.states.get(_BATTERY).state == "42"
+    assert hass.states.get("number.bridge_test_volume").state == "40"
+    assert hass.states.get("switch.bridge_test_child_lock").state == "off"
+    assert hass.states.get("time.bridge_test_dnd_start").state == "22:00:00"
+    assert hass.states.get(_VACUUM).attributes["schedule"][0]["id"] == 1
+    assert not hass.services.has_service(DOMAIN, SERVICE_READ_LOCAL_BATTERY)
+    assert {post["method"] for post in candidate_bridge.posts} == {"get_properties"}
+
+    await hass.services.async_call("vacuum", "start", {"entity_id": _VACUUM}, blocking=True)
+    await hass.services.async_call("number", "set_value", {"entity_id": "number.bridge_test_volume", "value": 55}, blocking=True)
+    assert [(post["method"], post["params"]) for post in candidate_bridge.posts[-3:]] == [
+        ("action", {"did": "2.1", "siid": 2, "aiid": 1, "in": []}),
+        ("set_properties", [{"did": "7.1", "siid": 7, "piid": 1, "value": 55}]),
+        ("action", {"did": "7.2", "siid": 7, "aiid": 2, "in": []}),
+    ]
+    assert hass.states.get("number.bridge_test_volume").state == "40"
+    candidate_bridge.reported["91"] = 55
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    for _ in range(5):
+        await _refresh(hass, coordinator)
+    assert hass.states.get("number.bridge_test_volume").state == "55"
+
+    flow = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_RECONFIGURE, "entry_id": entry.entry_id}
+    )
+    await _configure(hass, candidate_bridge, flow["flow_id"], bridge_read_mode=READ_MODE_LEGACY)
+    await hass.async_block_till_done()
+    assert entry.state is ConfigEntryState.LOADED
+    assert registry.async_get(_VACUUM).id == vacuum_id
+    assert registry.async_get(_BATTERY).id == battery_id
+    assert registry.async_get(retired.entity_id).disabled_by is None
+    assert registry.async_get(user_disabled.entity_id).disabled_by is er.RegistryEntryDisabler.USER
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_candidate_reconnect_field_loss_and_ambiguous_mutation(hass, candidate_bridge):
+    entry, coordinator = await _load_entry(hass, candidate_bridge, bridge_read_mode="local_candidate")
+    candidate_bridge.rpc_error = "ambiguous"
+    with pytest.raises(HomeAssistantError, match="outcome unknown"):
+        await hass.services.async_call("vacuum", "return_to_base", {"entity_id": _VACUUM}, blocking=True)
+    assert len([post for post in candidate_bridge.posts if post["method"] == "action"]) == 1
+
+    candidate_bridge.epoch = None
+    await _refresh(hass, coordinator)
+    assert hass.states.get(_VACUUM).state == STATE_UNAVAILABLE
+    assert hass.states.get(_BATTERY).state == STATE_UNAVAILABLE
+
+    candidate_bridge.epoch = _NEW_EPOCH
+    candidate_bridge.reported.pop("91")
+    candidate_bridge.reported["2"] = 0
+    candidate_bridge.rpc_error = None
+    await _refresh(hass, coordinator)
+    assert hass.states.get(_BATTERY).state == "0"
+    assert hass.states.get("number.bridge_test_volume").state == STATE_UNAVAILABLE
+    assert len([post for post in candidate_bridge.posts if post["method"] == "action"]) == 1
+    assert all(post["method"] == "get_properties" for post in candidate_bridge.posts
+               if post["epoch"] == _NEW_EPOCH)
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.parametrize(
+    ("service", "fields", "mode", "target_key", "rows"),
+    [
+        ("vacuum_clean_segment", {"segments": [1, 3], "repeats": [1, 2]}, 18, "selects",
+         [[1, 1, 1, 1, 1], [3, 2, 1, 1, 2]]),
+        ("vacuum_clean_zone", {"zone": [0, 0, 500, 500], "repeats": 2}, 19, "areas",
+         [[0, 0, 500, 500, 2, 1, 1]]),
+        ("vacuum_clean_spot", {"points": [[150, 250]], "repeats": 1}, 20, "points",
+         [[150, 250, 1, 1, 1]]),
+    ],
+)
+async def test_candidate_native_parameterized_cleaning(hass, candidate_bridge, service, fields, mode, target_key, rows):
+    entry, _ = await _load_entry(hass, candidate_bridge, bridge_read_mode="local_candidate")
+    await hass.services.async_call(DOMAIN, service, {"entity_id": _VACUUM, **fields}, blocking=True)
+    post = candidate_bridge.posts[-1]
+    assert post["method"] == "action"
+    assert post["params"] == {
+        "did": "4.1", "siid": 4, "aiid": 1,
+        "in": [{"piid": 1, "value": mode}, {"piid": 10, "value": json.dumps({target_key: rows}, separators=(",", ":"))}],
+    }
+    assert hass.states.get(_VACUUM).state == "idle"
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_candidate_dnd_and_schedules_use_native_controls(hass, candidate_bridge):
+    entry, _ = await _load_entry(hass, candidate_bridge, bridge_read_mode="local_candidate")
+    time_id = "time.bridge_test_dnd_start"
+    await hass.services.async_call("time", "set_value", {"entity_id": time_id, "time": "21:30:00"}, blocking=True)
+    assert candidate_bridge.posts[-1]["params"] == [{"did": "5.2", "siid": 5, "piid": 2, "value": "21:30"}]
+    await hass.services.async_call(DOMAIN, "vacuum_delete_scheduled_task", {
+        "entity_id": _VACUUM, "schedule_id": 1,
+    }, blocking=True)
+    assert candidate_bridge.posts[-1]["params"] == {
+        "did": "8.1", "siid": 8, "aiid": 1, "in": [{"piid": 3, "value": 1}],
+    }
+    schedule = "1-0-08:30-1111111-1-0-1-1-0"
+    await hass.services.async_call(DOMAIN, "vacuum_set_schedule", {
+        "entity_id": _VACUUM, "schedule": schedule,
+    }, blocking=True)
+    assert candidate_bridge.posts[-1]["params"] == [{"did": "8.2", "siid": 8, "piid": 2, "value": schedule}]
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_candidate_push_and_ordered_map_reports_reach_native_entities(hass, candidate_bridge):
+    from test_local_maps import frame
+
+    entry, coordinator = await _load_entry(hass, candidate_bridge, bridge_read_mode="local_candidate")
+    map_entity = "camera.bridge_test_map"
+    assert hass.states.get(map_entity).state == STATE_UNAVAILABLE
+
+    candidate_bridge.sequence = 1
+    candidate_bridge.push = [_property("2", 3, 39)]
+    candidate_bridge.map_reports = [{
+        "sequence": 1,
+        "properties": [_property("87", 6, f"0,{frame()}", piid=13)],
+    }]
+    await _refresh(hass, coordinator)
+    assert hass.states.get(_BATTERY).state == "39"
+    assert coordinator.device.status.current_map.map_id == 7
+    assert hass.states.get(map_entity).state != STATE_UNAVAILABLE
+    assert {post["method"] for post in candidate_bridge.posts} == {"get_properties"}
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_candidate_push_cache_does_not_refresh_unrelated_stale_fields(hass, candidate_bridge):
+    candidate_bridge.sequence = 1
+    candidate_bridge.push = [_property("2", 3, 42)]
+    entry, coordinator = await _load_entry(hass, candidate_bridge, bridge_read_mode="local_candidate")
+    assert hass.states.get(_BATTERY).state == "42"
+
+    # Keep the session alive while reads fail and only an unrelated property changes.
+    coordinator._seen["2"] = hass.loop.time() - 26
+    candidate_bridge.fail_reads = True
+    candidate_bridge.sequence = 2
+    candidate_bridge.push.append(_property("0", 2, 2))
+    await _refresh(hass, coordinator)
+    assert hass.states.get(_BATTERY).state == STATE_UNAVAILABLE
+    assert hass.states.get(_VACUUM).state == "idle"
+    assert {post["method"] for post in candidate_bridge.posts} == {"get_properties"}
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+def _candidate_map(bridge, sequence, position):
+    from test_local_maps import frame, NOW_MS
+
+    bridge.sequence = sequence
+    bridge.map_reports = [{
+        "sequence": sequence,
+        "properties": [_property(
+            "87", 6, f"0,{frame(sequence, timestamp=NOW_MS + sequence * 1000, robot=position)}", piid=13,
+        )],
+    }]
+
+
+async def test_candidate_goto_stops_on_new_target_frame_and_restores_owned_setting(hass, candidate_bridge):
+    _candidate_map(candidate_bridge, 1, (50, 50))
+    entry, coordinator = await _load_entry(hass, candidate_bridge, bridge_read_mode="local_candidate")
+    await hass.services.async_call(
+        DOMAIN, "vacuum_goto", {"entity_id": _VACUUM, "x": 250, "y": 250}, blocking=True,
+    )
+    assert [post["params"] for post in candidate_bridge.posts if post["method"] == "action"] == [{
+        "did": "4.1", "siid": 4, "aiid": 1, "in": [
+            {"piid": 1, "value": 19}, {"piid": 10, "value": '{"areas":[[200,200,300,300,1,0,1]]}'},
+        ],
+    }]
+    assert coordinator.device.status.go_to_zone is None
+    candidate_bridge.reported.update({"11": 2, "5": 19, "0": 1, "27": 1})
+    _candidate_map(candidate_bridge, 2, (250, 250))
+    await _refresh(hass, coordinator)
+    async with timeout(2):
+        while coordinator._goto is not None:
+            await sleep(0)
+    mutations = [post["params"] for post in candidate_bridge.posts if post["method"] != "get_properties"]
+    assert mutations[-2:] == [
+        {"did": "4.2", "siid": 4, "aiid": 2, "in": []},
+        [{"did": "4.23", "siid": 4, "piid": 23, "value": 0}],
+    ]
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.parametrize("interrupt", ["pause", "reconnect"])
+async def test_candidate_goto_continuation_cancels_on_new_motion_or_epoch(hass, candidate_bridge, interrupt):
+    _candidate_map(candidate_bridge, 1, (50, 50))
+    entry, coordinator = await _load_entry(hass, candidate_bridge, bridge_read_mode="local_candidate")
+    await hass.services.async_call(
+        DOMAIN, "vacuum_goto", {"entity_id": _VACUUM, "x": 250, "y": 250}, blocking=True,
+    )
+    if interrupt == "pause":
+        await hass.services.async_call("vacuum", "pause", {"entity_id": _VACUUM}, blocking=True)
+    else:
+        candidate_bridge.epoch = _NEW_EPOCH
+    candidate_bridge.reported.update({"11": 2, "5": 19, "0": 1, "27": 1})
+    _candidate_map(candidate_bridge, 2, (250, 250))
+    await _refresh(hass, coordinator)
+    assert coordinator._goto is None
+    assert not any(post["method"] == "action" and post["params"]["did"] == "4.2"
+                   for post in candidate_bridge.posts)
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_candidate_goto_respects_later_explicit_setting_attempt(hass, candidate_bridge):
+    _candidate_map(candidate_bridge, 1, (50, 50))
+    candidate_bridge.reported["9"] = 2
+    entry, coordinator = await _load_entry(hass, candidate_bridge, bridge_read_mode="local_candidate")
+    await hass.services.async_call(
+        DOMAIN, "vacuum_goto", {"entity_id": _VACUUM, "x": 250, "y": 250}, blocking=True,
+    )
+    assert coordinator._goto.restore[DreameVacuumProperty.WATER_VOLUME] == (2, 1)
+    candidate_bridge.rpc_error = "ambiguous"
+    with pytest.raises(HomeAssistantError, match="outcome unknown"):
+        await coordinator.async_execute_command(coordinator.device.set_property, DreameVacuumProperty.WATER_VOLUME, 1)
+    assert DreameVacuumProperty.WATER_VOLUME not in coordinator._goto.restore
+    candidate_bridge.rpc_error = None
+    candidate_bridge.reported.update({"11": 2, "5": 19, "0": 1, "27": 1, "9": 1})
+    _candidate_map(candidate_bridge, 2, (250, 250))
+    await _refresh(hass, coordinator)
+    async with timeout(2):
+        while coordinator._goto is not None:
+            await sleep(0)
+    assert candidate_bridge.posts[-1]["params"] == [{"did": "4.23", "siid": 4, "piid": 23, "value": 0}]
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.parametrize(
+    ("reported", "enabled", "observed"),
+    [
+        (2, 34, 34),
+        ('{"obstacle_detect_switch":true,"obstacle_app_display_switch":false}',
+         '{"obstacle_app_display_switch":true}',
+         '{"obstacle_detect_switch":true,"obstacle_app_display_switch":true}'),
+    ],
+)
+async def test_candidate_obstacle_upload_switch_is_explicit_and_uses_reported_format(
+    hass, candidate_bridge, reported, enabled, observed,
+):
+    candidate_bridge.reported["26"] = reported
+    entry, coordinator = await _load_entry(hass, candidate_bridge, bridge_read_mode="local_candidate")
+    picture = "switch.bridge_test_ai_obstacle_picture"
+    upload = "switch.bridge_test_ai_obstacle_image_upload"
+    detection = "switch.bridge_test_ai_obstacle_detection"
+    assert hass.states.get(detection).state == "on"
+    assert hass.states.get(upload).state == "off"
+    assert (hass.states.get(picture) is not None) == (type(reported) is int)
+    assert not any(post["method"] != "get_properties" for post in candidate_bridge.posts)
+
+    await hass.services.async_call("switch", "turn_on", {"entity_id": upload}, blocking=True)
+    assert hass.states.get(upload).state == "off"
+    assert candidate_bridge.posts[-1]["params"] == [{"did": "4.22", "siid": 4, "piid": 22, "value": enabled}]
+
+    candidate_bridge.reported["26"] = observed
+    await _refresh(hass, coordinator)
+    assert hass.states.get(upload).state == "on"
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_candidate_picture_bit_and_reported_ai_eligibility(hass, candidate_bridge):
+    candidate_bridge.reported["26"] = '{"obstacle_detect_switch":true}'
+    entry, coordinator = await _load_entry(hass, candidate_bridge, bridge_read_mode="local_candidate")
+    picture = "switch.bridge_test_ai_obstacle_picture"
+    upload = "switch.bridge_test_ai_obstacle_image_upload"
+    assert hass.states.get(picture) is None
+    assert hass.states.get(upload) is None
+
+    candidate_bridge.sequence = 1
+    candidate_bridge.push = [_property("26", 4, 2, piid=22)]
+    await _refresh(hass, coordinator)
+    assert hass.states.get(picture).state == "off"
+    await hass.services.async_call("switch", "turn_on", {"entity_id": picture}, blocking=True)
+    assert candidate_bridge.posts[-1]["params"] == [{"did": "4.22", "siid": 4, "piid": 22, "value": 6}]
+    assert await hass.config_entries.async_unload(entry.entry_id)

@@ -19,7 +19,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from .const import DOMAIN
 
 from .coordinator import DreameVacuumDataUpdateCoordinator
-from .entity import DreameVacuumEntity, DreameVacuumEntityDescription, remove_entities
+from .entity import DreameVacuumEntity, DreameVacuumEntityDescription, setup_native_entities
 from .dreame import ATTR_TYPE, ATTR_CODE, ATTR_ITEMS, DreameVacuumProperty
 
 
@@ -89,11 +89,8 @@ async def async_setup_entry(
     """Set up Dreame Vacuum Binary Sensor based on a config entry."""
     coordinator: DreameVacuumDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
 
-    remove_entities(hass, entry, coordinator, "binary_sensor", BINARY_SENSORS)
-    async_add_entities(
-        DreameVacuumBinarySensorEntity(coordinator, description)
-        for description in BINARY_SENSORS
-        if description.exists_fn(description, coordinator.device)
+    setup_native_entities(
+        hass, entry, coordinator, "binary_sensor", BINARY_SENSORS, DreameVacuumBinarySensorEntity, async_add_entities
     )
 
 

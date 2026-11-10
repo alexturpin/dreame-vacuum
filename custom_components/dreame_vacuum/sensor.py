@@ -16,6 +16,7 @@ from homeassistant.components.sensor import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import STATE_UNKNOWN
 from homeassistant.helpers.icon import icon_for_battery_level
+from homeassistant.helpers import entity_registry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -38,8 +39,8 @@ from .dreame import (
     DreameVacuumStreamStatus,
 )
 from .coordinator import DreameVacuumDataUpdateCoordinator
-from .local_bridge import LocalBridgeCoordinator, LocalBridgeEntity, bridge_property_label, is_local_bridge
-from .entity import DreameVacuumEntity, DreameVacuumEntityDescription, remove_entities
+from .local_bridge import LocalBridgeCoordinator, LocalBridgeEntity, bridge_property_label, is_local_bridge, is_local_candidate
+from .entity import DreameVacuumEntity, DreameVacuumEntityDescription, setup_native_entities
 
 STREAM_STATUS_TO_ICON = {
     DreameVacuumStreamStatus.IDLE: "mdi:webcam",
@@ -673,7 +674,7 @@ async def async_setup_entry(
 ) -> None:
     """Set up Dreame Vacuum sensor based on a config entry."""
     coordinator = hass.data[DOMAIN][entry.entry_id]
-    if is_local_bridge(entry.data):
+    if is_local_bridge(entry.data) and not is_local_candidate(entry.data):
         entities = []
         if not coordinator.durable_refresh_enabled:
             entities.append(LocalBridgeBattery(coordinator))
@@ -689,12 +690,17 @@ async def async_setup_entry(
         async_add_entities(entities)
         return
 
-    remove_entities(hass, entry, coordinator, "sensor", SENSORS)
-    async_add_entities(
-        DreameVacuumSensorEntity(coordinator, description)
-        for description in SENSORS
-        if description.exists_fn(description, coordinator.device)
+    setup_native_entities(
+        hass, entry, coordinator, "sensor", SENSORS, DreameVacuumSensorEntity, async_add_entities
     )
+    if is_local_candidate(entry.data):
+        registry = entity_registry.async_get(hass)
+        async_add_entities([
+            LocalBridgePassiveProperty(coordinator, prop)
+            for prop in (DreameVacuumProperty.STATE, DreameVacuumProperty.STATUS)
+            if registry.async_get_entity_id("sensor", DOMAIN, f"{entry.entry_id}_local_passive_{prop.name.lower()}")
+        ])
+
 
 
 class DreameVacuumSensorEntity(DreameVacuumEntity, SensorEntity):
@@ -765,7 +771,10 @@ class LocalBridgePassiveProperty(LocalBridgeEntity, SensorEntity):
     @property
     def extra_state_attributes(self) -> dict | None:
         if (value := self._value) is not None:
-            return {"provenance": "passive", "value": value}
+            return {
+                "provenance": "candidate" if self.coordinator.device._local_candidate else "passive",
+                "value": value,
+            }
         return None
 
 
