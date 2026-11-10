@@ -20,6 +20,7 @@ _OBJECT_NAME = re.compile(r"local/[0-9a-f]{32}(?:/[0-9]{1,4})?")
 _OBSTACLE_FILENAME = re.compile(r"/data/record/[0-9]{1,10}\.jpg-[0-9]{1,20}")
 _MAX_MAP_OBJECT_BYTES = 2 * 1024 * 1024
 _MIN_WALL_CLOCK_MS = 1577826000000  # Tasshack's cutoff for robot uptime.
+_UPTIME_CLOCK_SKEW_MS = 1000
 _MAP_SERVICE = 6
 _MAP_DATA, _OBJECT, _ROBOT_TIME, _MAP_LIST, _RECOVERY_LIST, _LEGACY_MAP = 1, 3, 5, 8, 9, 13
 _I_REQUEST = {"req_type": 1, "frame_type": "I", "force_type": 1}
@@ -45,6 +46,10 @@ def _is_obstacle_jpeg(data):
 class DreameLocalMapEditor(DreameMapVacuumMapEditor):
     def refresh_map(self, map_id=None):
         self._refresh_map(map_id)
+
+
+class _ProjectedUptime(int):
+    """Distinguish timestamps projected from uptime from genuine wall times."""
 
 
 class DreameLocalMapManager(DreameMapVacuumMapManager):
@@ -184,7 +189,26 @@ class DreameLocalMapManager(DreameMapVacuumMapManager):
             # Anchor once per session so late I/P frames keep their robot-time order.
             latest = self._latest_map_timestamp_ms or self._current_timestamp_ms or 0
             self._uptime_offset_ms = max(int(time.time() * 1000), latest + 1) - uptime
-        return self._uptime_offset_ms + uptime
+        return _ProjectedUptime(self._uptime_offset_ms + uptime)
+
+    def _bound_uptime_projection(self, timestamp):
+        lead = timestamp - int(time.time() * 1000)
+        if lead <= _UPTIME_CLOCK_SKEW_MS:
+            return
+        # Replayed reports can span hours while arriving in one poll. Shift all
+        # projected times together to keep the I/P queue in the same clock domain.
+        self._uptime_offset_ms -= lead
+
+        def shift(value):
+            return _ProjectedUptime(value - lead) if isinstance(value, _ProjectedUptime) else value
+
+        self._current_timestamp_ms = shift(self._current_timestamp_ms)
+        self._latest_map_timestamp_ms = shift(self._latest_map_timestamp_ms)
+        if self._map_data is not None:
+            self._map_data.timestamp_ms = shift(self._map_data.timestamp_ms)
+        for frames in self._map_data_queue.values():
+            for frame in frames.values():
+                frame.timestamp_ms = shift(frame.timestamp_ms)
 
     def _ingest_frame(self, raw, timestamp, key=None):
         if not isinstance(raw, str) or not 0 < len(raw) <= _MAX_MAP_OBJECT_BYTES:
@@ -226,6 +250,10 @@ class DreameLocalMapManager(DreameMapVacuumMapManager):
             _LOGGER.warning("Ignoring an invalid local map frame")
             return False
         changed = before != (self._current_map_id, self._current_frame_id, self._current_timestamp_ms)
+        if isinstance(partial.timestamp_ms, _ProjectedUptime) and (
+            changed or partial.timestamp_ms == self._latest_map_timestamp_ms
+        ):
+            self._bound_uptime_projection(partial.timestamp_ms)
         if changed:
             self._revision += 1
         return changed

@@ -162,6 +162,28 @@ def test_uptime_map_response_replaces_wall_clock_map_and_orders_deltas(monkeypat
     assert manager.get_map().timestamp_ms == normalized + 400
 
 
+def test_cached_uptime_replay_keeps_map_timestamps_near_receipt_time(monkeypatch):
+    monkeypatch.setattr("custom_components.dreame_vacuum.dreame.local_map.time.time", lambda: NOW_MS / 1000)
+    manager, protocol = setup_manager()
+    manager.ingest_properties([row(1, frame(71, map_id=2, timestamp=17919527))])
+    manager.ingest_properties([row(1, frame(73, map_id=2, timestamp=59084828))])
+    assert manager.get_map().timestamp_ms == NOW_MS
+
+    manager.ingest_properties([row(1, frame(275, "P", map_id=3, timestamp=59834734, pixels=bytes(64)))])
+    assert manager.get_map().map_id == 2  # The new map needs an I-frame.
+    protocol.out = [{"piid": 1, "value": ""}, {"piid": 3, "value": ""}, {"piid": 5, "value": 59923497}]
+    manager.update()
+    assert protocol.repair_requests == [{"req_type": 1, "frame_type": "I", "force_type": 1}]
+    assert manager.get_map().map_id == 2  # The acknowledgement contains no frame.
+
+    protocol.out = [{"piid": 13, "value": f"0,{frame(274, map_id=3, timestamp=59834733)}"}]
+    manager.request_new_map()
+    assert (manager.get_map().map_id, manager.get_map().frame_id) == (3, 275)
+    assert manager.get_map().timestamp_ms == NOW_MS
+    manager.ingest_properties([row(1, frame(1, map_id=4, timestamp=NOW_MS + 1))])
+    assert manager.get_map().map_id == 4
+
+
 @pytest.mark.usefixtures("enable_custom_integrations")
 async def test_inline_map_action_output_reaches_native_camera(hass, candidate_bridge):
     entry, coordinator = await _load_entry(hass, candidate_bridge, bridge_read_mode="local_candidate")
@@ -190,6 +212,35 @@ async def test_inline_map_action_output_reaches_native_camera(hass, candidate_br
     with Image.open(BytesIO(image)) as rendered:
         rendered.verify()
     assert [post["params"] for post in candidate_bridge.posts if post["method"] == "action"] == actions
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_legacy_inline_uptime_output_replaces_camera_map_while_cleaning(hass, candidate_bridge):
+    candidate_bridge.reported.update({"11": 2, "5": 19, "0": 1, "27": 1})
+    candidate_bridge.sequence = 1
+    candidate_bridge.map_reports = [{
+        "sequence": 1,
+        "properties": [{"did": "76", "siid": 6, "piid": 1, "code": 0,
+                        "value": frame(73, map_id=2)}],
+    }]
+    entry, coordinator = await _load_entry(hass, candidate_bridge, bridge_read_mode="local_candidate")
+    assert coordinator.device.status.running
+    camera_id = "camera.bridge_test_map"
+    assert hass.states.get(camera_id).attributes["map_id"] == 2
+    candidate_bridge.rpc_out = [
+        {"piid": 1, "value": ""},
+        {"piid": 3, "value": ""},
+        {"piid": 13, "value": f"0,{frame(54, map_id=3, timestamp=59238825)}"},
+        {"piid": 5, "value": 59249228},
+    ]
+    await hass.services.async_call(DOMAIN, "vacuum_request_map", {"entity_id": _VACUUM}, blocking=True)
+    await hass.async_block_till_done()
+
+    assert coordinator.device.status.current_map.frame_id == 54
+    camera_attributes = hass.states.get(camera_id).attributes
+    assert (camera_attributes["map_id"], camera_attributes["frame_id"]) == (3, 54)
+    assert [post["params"]["did"] for post in candidate_bridge.posts if post["method"] == "action"] == ["6.1"]
     assert await hass.config_entries.async_unload(entry.entry_id)
 
 
