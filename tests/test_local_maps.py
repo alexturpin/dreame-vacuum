@@ -462,3 +462,46 @@ def test_checkpoint_does_not_restore_a_stale_map():
     manager.ingest_properties([row(1, frame(2, timestamp=NOW_MS + 1))])
     manager.restore_checkpoint(checkpoint)
     assert manager.get_map().frame_id == 2
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_relocation_retains_rendered_map_with_explicit_stale_flag(hass, candidate_bridge, monkeypatch):
+    candidate_bridge.sequence = 1
+    candidate_bridge.map_reports = [{
+        "sequence": 1,
+        "properties": [{"did": "76", "siid": 6, "piid": 1, "code": 0, "value": frame()}],
+    }]
+    entry, coordinator = await _load_entry(hass, candidate_bridge, bridge_read_mode="local_candidate")
+    camera = hass.data["camera"].get_entity("camera.bridge_test_map")
+    image = await camera.async_camera_image()
+    state = camera.state
+    posts = len(candidate_bridge.posts)
+    monkeypatch.setattr(type(coordinator.device.status), "located", property(lambda self: False))
+    camera._handle_coordinator_update()
+    assert camera.state == state
+    assert camera.extra_state_attributes["map_stale"] is True
+    assert camera.extra_state_attributes["map_stale_reason"] == "relocating"
+    assert await camera.async_camera_image() == image
+    assert len(candidate_bridge.posts) == posts
+    monkeypatch.setattr(type(coordinator.device.status), "located", property(lambda self: True))
+    camera._handle_coordinator_update()
+    assert camera.extra_state_attributes["map_stale"] is False
+    assert camera.extra_state_attributes["map_stale_reason"] is None
+    # Losing connectivity must not be disguised as relocation.
+    monkeypatch.setattr(type(coordinator.device.status), "located", property(lambda self: False))
+    monkeypatch.setattr(type(coordinator.device), "map_connected", property(lambda self: False))
+    camera._handle_coordinator_update()
+    assert camera.state == STATE_UNAVAILABLE
+    assert camera.extra_state_attributes["map_stale"] is False
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_relocation_without_rendered_map_stays_unavailable(hass, candidate_bridge, monkeypatch):
+    entry, coordinator = await _load_entry(hass, candidate_bridge, bridge_read_mode="local_candidate")
+    camera = hass.data["camera"].get_entity("camera.bridge_test_map")
+    monkeypatch.setattr(type(coordinator.device.status), "located", property(lambda self: False))
+    camera._handle_coordinator_update()
+    assert camera.state == STATE_UNAVAILABLE
+    assert camera.extra_state_attributes["map_stale"] is False
+    assert await hass.config_entries.async_unload(entry.entry_id)

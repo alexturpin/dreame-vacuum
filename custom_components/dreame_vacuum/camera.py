@@ -706,10 +706,27 @@ class DreameVacuumCameraEntity(DreameVacuumEntity, Camera):
                 "camera", key, f"Saved {'Wifi ' if wifi_map else ''}Map {name}", name=name
             )
 
+    @property
+    def _map_stale(self) -> bool:
+        """Keep a rendered local map visible while the robot relocates."""
+        return bool(
+            self.device._local_candidate
+            and self.map_index == 0
+            and not self.map_data_json
+            and self.device.map_connected
+            and not self.device.status.located
+            and self._map_data
+            and self._last_rendered != -1
+            and self._default_map is False
+        )
+
     @callback
     def _handle_coordinator_update(self) -> None:
         """Fetch state from the device."""
         self._last_map_request = 0
+        if self._map_stale:
+            self.async_write_ha_state()
+            return
         map_data = self._map_data
         if map_data and self.device.map_connected and (self.map_index > 0 or self.device.status.located):
             if map_data.last_updated:
@@ -753,6 +770,8 @@ class DreameVacuumCameraEntity(DreameVacuumEntity, Camera):
         self.async_write_ha_state()
 
     async def async_camera_image(self, width: int | None = None, height: int | None = None) -> bytes | None:
+        if self._map_stale:
+            return self._image
         if self._should_poll is True:
             self._should_poll = False
             try:
@@ -837,6 +856,8 @@ class DreameVacuumCameraEntity(DreameVacuumEntity, Camera):
             self._proxy_renderer = None
 
     def update(self) -> None:
+        if self._map_stale:
+            return
         map_data = self._map_data
         if map_data and self.device.map_connected and (self.map_index > 0 or self.device.status.located):
             self._device_active = self.device.status.active
@@ -1203,7 +1224,7 @@ class DreameVacuumCameraEntity(DreameVacuumEntity, Camera):
                 map_data
                 and self.device.map_connected
                 and not map_data.empty_map
-                and (self.map_index > 0 or self.device.status.located)
+                and (self.map_index > 0 or self.device.status.located or self._map_stale)
             ):
                 attributes = map_data.as_dict()
                 if not attributes:
@@ -1261,6 +1282,10 @@ class DreameVacuumCameraEntity(DreameVacuumEntity, Camera):
 
             if not attributes:
                 attributes = {}
+
+            if self.device._local_candidate and self.map_index == 0:
+                attributes["map_stale"] = self._map_stale
+                attributes["map_stale_reason"] = "relocating" if self._map_stale else None
 
             if self.map_index:
                 attributes[ATTR_SELECTED] = (
