@@ -124,6 +124,44 @@ def test_explicit_request_uses_native_action_and_ingests_output():
     assert manager.get_map().frame_id == 1
 
 
+def test_uptime_map_response_replaces_wall_clock_map_and_orders_deltas(monkeypatch):
+    monkeypatch.setattr("custom_components.dreame_vacuum.dreame.local_map.time.time", lambda: NOW_MS / 1000)
+    manager, protocol = setup_manager()
+    old_timestamp = NOW_MS + 500
+    manager.ingest_properties([row(1, frame(73, map_id=2, timestamp=old_timestamp))])
+
+    # The running robot returned a legacy inline I-frame and two uptime stamps.
+    uptime = 59238825
+    protocol.out = [
+        {"piid": 1, "value": ""},
+        {"piid": 3, "value": ""},
+        {"piid": 13, "value": f"0,{frame(54, map_id=3, timestamp=uptime)}"},
+        {"piid": 5, "value": 59249228},
+    ]
+    assert manager.request_new_map()["code"] == 0
+    new_map = manager.get_map()
+    assert (new_map.map_id, new_map.frame_id) == (3, 54)
+    normalized = new_map.timestamp_ms
+    assert normalized > old_timestamp
+
+    revision = manager.revision
+    protocol.out[-1]["value"] += 1
+    manager.request_new_map()
+    assert manager.revision == revision
+    assert manager.get_map().timestamp_ms == normalized
+
+    manager.ingest_properties([row(1, frame(56, "P", map_id=3, timestamp=uptime + 400, pixels=bytes(64))),
+                               row(5, uptime + 12000)])
+    assert manager.get_map().frame_id == 54
+    protocol.out = [
+        {"piid": 1, "value": frame(55, "P", map_id=3, timestamp=uptime + 200, pixels=bytes(64))},
+        {"piid": 5, "value": uptime + 13000},
+    ]
+    manager.request_new_map()
+    assert manager.get_map().frame_id == 56
+    assert manager.get_map().timestamp_ms == normalized + 400
+
+
 @pytest.mark.usefixtures("enable_custom_integrations")
 async def test_inline_map_action_output_reaches_native_camera(hass, candidate_bridge):
     entry, coordinator = await _load_entry(hass, candidate_bridge, bridge_read_mode="local_candidate")

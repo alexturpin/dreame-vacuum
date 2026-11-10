@@ -51,3 +51,24 @@ and compare the rendered camera to the robot's observed state. An empty map
 is a normal outcome. A populated map and room boundaries require observed
 cleaning or mapping progress, and a missing or malformed live frame requires
 separately retained private evidence for decoder diagnosis.
+
+
+## Cleaning-run uptime correction (local.11)
+
+A subsequent supervised run supplied a new map through legacy inline property
+13 (`0,<frame>`), while both embedded `timestamp_ms` and property 5 used robot
+uptime. Treating property 5 as wall-clock time left the new map behind the
+previous map's wall-clock ordering watermark, freezing the HA camera.
+
+The local manager now anchors uptime to wall-clock time once per session,
+ensuring the first normalized frame follows any existing watermark. Embedded
+uptime preserves relative frame ordering when later reports arrive out of
+order; repeated raw frames remain deduplicated before conversion. Resetting
+the session clears the anchor. Valid wall-clock frame/report times retain
+existing handling. This does not set the robot clock.
+
+The synthetic regression replaces a wall-clock map with a legacy inline uptime
+map, checks repeated-frame deduplication and applies out-of-order P frames.
+All 15 map tests and 7 candidate diagnostics tests passed under the offline
+guard. A privately retained real response also decoded and rendered through
+the manager offline; its map bytes and image are not part of the repository.

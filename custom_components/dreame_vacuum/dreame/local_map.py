@@ -19,6 +19,7 @@ _LOGGER = logging.getLogger(__name__)
 _OBJECT_NAME = re.compile(r"local/[0-9a-f]{32}(?:/[0-9]{1,4})?")
 _OBSTACLE_FILENAME = re.compile(r"/data/record/[0-9]{1,10}\.jpg-[0-9]{1,20}")
 _MAX_MAP_OBJECT_BYTES = 2 * 1024 * 1024
+_MIN_WALL_CLOCK_MS = 1577826000000  # Tasshack's cutoff for robot uptime.
 _MAP_SERVICE = 6
 _MAP_DATA, _OBJECT, _ROBOT_TIME, _MAP_LIST, _RECOVERY_LIST, _LEGACY_MAP = 1, 3, 5, 8, 9, 13
 _I_REQUEST = {"req_type": 1, "frame_type": "I", "force_type": 1}
@@ -55,6 +56,7 @@ class DreameLocalMapManager(DreameMapVacuumMapManager):
         self._lock = RLock()
         self._revision = 0
         self._recent_frames = []
+        self._uptime_offset_ms = None
         self._pending_object = None
         self._loaded_lists = {}
         self._list_retry_at = 0.0
@@ -66,6 +68,7 @@ class DreameLocalMapManager(DreameMapVacuumMapManager):
             self._init_data()
             self._map_list_object_name = self._map_list_md5 = self._recovery_map_list_object_name = None
             self._recent_frames.clear()
+            self._uptime_offset_ms = None
             self._pending_object = None
             self._loaded_lists.clear()
             self._list_retry_at = 0.0
@@ -169,10 +172,25 @@ class DreameLocalMapManager(DreameMapVacuumMapManager):
             if map_id != self._latest_map_id:
                 del self._map_data_queue[map_id]
 
+    def _frame_timestamp(self, frame_time, report_time):
+        for timestamp in (frame_time, report_time):
+            if timestamp is not None and timestamp >= _MIN_WALL_CLOCK_MS:
+                return timestamp
+
+        uptime = frame_time if frame_time and frame_time > 0 else report_time
+        if uptime is None:
+            return int(time.time() * 1000)
+        if self._uptime_offset_ms is None:
+            # Anchor once per session so late I/P frames keep their robot-time order.
+            latest = self._latest_map_timestamp_ms or self._current_timestamp_ms or 0
+            self._uptime_offset_ms = max(int(time.time() * 1000), latest + 1) - uptime
+        return self._uptime_offset_ms + uptime
+
     def _ingest_frame(self, raw, timestamp, key=None):
         if not isinstance(raw, str) or not 0 < len(raw) <= _MAX_MAP_OBJECT_BYTES:
             return False
         watermark = self._latest_map_timestamp_ms, self._latest_map_id
+        uptime_offset = self._uptime_offset_ms
         try:
             fingerprint = sha256((raw + "," + (key or "")).encode()).digest()
             if fingerprint in self._recent_frames:
@@ -196,10 +214,7 @@ class DreameLocalMapManager(DreameMapVacuumMapManager):
                     _LOGGER.warning("Ignoring a local map frame with invalid metadata")
                     return False
 
-            # Match the native manager's uptime correction, but only let a
-            # supported, complete frame set the ordering watermark.
-            if partial.timestamp_ms is None or partial.timestamp_ms < 1577826000000:
-                partial.timestamp_ms = timestamp or int(time.time() * 1000)
+            partial.timestamp_ms = self._frame_timestamp(partial.timestamp_ms, timestamp)
             if self._latest_map_timestamp_ms is None or partial.timestamp_ms > self._latest_map_timestamp_ms:
                 self._latest_map_timestamp_ms = partial.timestamp_ms
                 self._latest_map_id = partial.map_id
@@ -207,6 +222,7 @@ class DreameLocalMapManager(DreameMapVacuumMapManager):
             super()._add_map_data(partial)
         except (ArithmeticError, IndexError, KeyError, RecursionError, TypeError, ValueError):
             self._latest_map_timestamp_ms, self._latest_map_id = watermark
+            self._uptime_offset_ms = uptime_offset
             _LOGGER.warning("Ignoring an invalid local map frame")
             return False
         changed = before != (self._current_map_id, self._current_frame_id, self._current_timestamp_ms)
