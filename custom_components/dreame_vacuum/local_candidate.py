@@ -52,6 +52,8 @@ _GOTO_SETTINGS = (P.CLEANING_MODE, P.SUCTION_LEVEL, P.WATER_VOLUME)
 _MOVEMENT_ACTIONS = {(2, 1), (2, 2), (3, 1), (4, 1), (4, 2)}
 _CORE_PROPERTIES = (P.STATE, P.ERROR, P.STATUS, P.TASK_STATUS, P.CHARGING_STATUS, P.BATTERY_LEVEL)
 # Candidate allowlist. Keep the optional addresses aligned with the owner registry.
+# r2250 rejects the two mop consumable counters with errors lacking a piid,
+# which prevents the owner from correlating a batch containing either counter.
 _OTHER_PROPERTIES = (
     P.OFF_PEAK_CHARGING, P.CLEANING_TIME, P.CLEANED_AREA,
     P.SUCTION_LEVEL, P.WATER_VOLUME, P.WATER_TANK,
@@ -73,7 +75,7 @@ _OTHER_PROPERTIES = (
     P.SIDE_BRUSH_LEFT, P.FILTER_LEFT, P.FILTER_TIME_LEFT,
     P.FIRST_CLEANING_DATE, P.TOTAL_CLEANING_TIME, P.CLEANING_COUNT,
     P.TOTAL_CLEANED_AREA, P.TOTAL_RUNTIME, P.SENSOR_DIRTY_LEFT,
-    P.SENSOR_DIRTY_TIME_LEFT, P.MOP_PAD_LEFT, P.MOP_PAD_TIME_LEFT,
+    P.SENSOR_DIRTY_TIME_LEFT,
 )
 _ADDRESS = {
     str(prop.value): mapping for prop, mapping in DreameVacuumPropertyMapping.items() if "piid" in mapping
@@ -568,15 +570,16 @@ class LocalCandidateCoordinator(DreameVacuumDataUpdateCoordinator):
             wanted = [*core, *other]
             for start in range(0, len(wanted), _BATCH_SIZE):
                 batch = wanted[start:start + _BATCH_SIZE]
-                self._last_read.update((prop, now) for prop in batch)
                 params = [{"did": str(prop.value), **_ADDRESS[str(prop.value)]} for prop in batch]
                 try:
                     result = await self.bridge.async_rpc(epoch, "get_properties", params)
                 except LocalBridgeError:
-                    # Keep the last sample until its own freshness deadline.
+                    # Keep the last sample until it expires and leave failed
+                    # core reads due for the next scheduled poll.
                     break
                 if self._closed:
                     return self.device
+                self._last_read.update((prop, now) for prop in batch)
                 self._readback.difference_update(batch)
                 for row in result:
                     if row["code"] == 0 or row["did"] not in rows:

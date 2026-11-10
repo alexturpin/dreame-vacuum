@@ -1,6 +1,7 @@
 """Synthetic objects use the documented Dreame frame layout, never a home map."""
 
 import base64
+from datetime import datetime
 from hashlib import md5, sha256
 from io import BytesIO
 import json
@@ -25,7 +26,7 @@ from custom_components.dreame_vacuum.dreame.types import (
     DreameVacuumDeviceCapability,
     DreameVacuumPropertyMapping,
 )
-from test_local_bridge import _VACUUM, _load_entry, candidate_bridge  # noqa: F401
+from test_local_bridge import _VACUUM, _load_entry, _refresh, candidate_bridge  # noqa: F401
 
 
 OBJECT = "local/" + "a" * 32 + "/2"
@@ -330,6 +331,37 @@ def test_map_list_and_history_reuse_tasshack_objects():
     assert history[0].date > history[1].date
     assert history[0].object_name == HISTORY
     assert manager.get_history_map(history[0].object_name, history[0].key).history_map
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_completed_history_snapshot_updates_native_sensor_without_property_push(hass, candidate_bridge):
+    entry, coordinator = await _load_entry(hass, candidate_bridge, bridge_read_mode="local_candidate")
+    entity_id = "sensor.bridge_test_cleaning_history"
+    assert hass.states.get(entity_id).state == STATE_UNAVAILABLE
+
+    start = NOW_MS // 1000
+    candidate_bridge.history = [{
+        "did": "12345",
+        "siid": 4,
+        "eiid": 1,
+        "arguments": [
+            {"piid": 2, "value": 37},
+            {"piid": 3, "value": 24},
+            {"piid": 8, "value": start},
+            {"piid": 9, "value": f"{HISTORY},{KEY}"},
+            {"piid": 13, "value": 1},
+        ],
+    }]
+    await _refresh(hass, coordinator)
+
+    state = hass.states.get(entity_id)
+    assert datetime.fromisoformat(state.state).timestamp() == start
+    record = next(value for value in state.attributes.values() if isinstance(value, dict))
+    assert record["cleaning_time"] == "37 min"
+    assert record["cleaned_area"] == "24 m²"
+    assert record["completed"] is True
+    assert {post["method"] for post in candidate_bridge.posts} == {"get_properties"}
+    assert await hass.config_entries.async_unload(entry.entry_id)
 
 
 def test_saved_backup_camera_read_and_explicit_restore_url_are_separate():
