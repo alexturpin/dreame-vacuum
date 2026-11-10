@@ -98,6 +98,15 @@ class DreameLocalMapManager(DreameMapVacuumMapManager):
         with self._lock:
             return self._revision
 
+    @property
+    def selected_map(self):
+        """Expose a saved map even before the robot provides a live frame."""
+        selected = self._saved_map_data.get(self._selected_map_id)
+        if selected is not None:
+            return selected
+        if len(self._map_list) == 1:
+            return self._saved_map_data.get(self._map_list[0])
+
     def restore_checkpoint(self, checkpoint):
         revision, state = checkpoint
         with self._lock:

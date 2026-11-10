@@ -334,6 +334,34 @@ def test_map_list_and_history_reuse_tasshack_objects():
 
 
 @pytest.mark.usefixtures("enable_custom_integrations")
+async def test_saved_map_camera_restores_without_live_frame(hass, candidate_bridge, monkeypatch):
+    from custom_components.dreame_vacuum.local_candidate import CandidateBridgeClient
+
+    saved_map = json.dumps({
+        "mapstr": [{"map": frame(map_id=14, extra={"fsm": 0, "ris": -1})}],
+        "curr_id": 14,
+    }).encode()
+    candidate_bridge.reported["83"] = json.dumps({
+        "object_name": LIST, "md5": md5(saved_map, usedforsecurity=False).hexdigest(),
+    })
+
+    async def get_object(client, name):
+        return saved_map if name == LIST else None
+
+    monkeypatch.setattr(CandidateBridgeClient, "async_map_object", get_object)
+    entry, coordinator = await _load_entry(hass, candidate_bridge, bridge_read_mode="local_candidate")
+
+    assert coordinator.device.status.current_map is None
+    assert coordinator.device.status.selected_map.map_id == 14
+    assert hass.states.get("camera.bridge_test_map").state == STATE_UNAVAILABLE
+    saved_camera = hass.states.get("camera.bridge_test_map_1")
+    assert saved_camera is not None
+    assert saved_camera.state != STATE_UNAVAILABLE
+    assert saved_camera.attributes["map_id"] == 14
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
 async def test_completed_history_snapshot_updates_native_sensor_without_property_push(hass, candidate_bridge):
     entry, coordinator = await _load_entry(hass, candidate_bridge, bridge_read_mode="local_candidate")
     entity_id = "sensor.bridge_test_cleaning_history"
