@@ -322,7 +322,7 @@ async def async_setup_entry(
     if is_local_bridge(entry.data):
         coordinator = hass.data[DOMAIN][entry.entry_id]
         if coordinator._read_mode == READ_MODE_ON_DEMAND:
-            async_add_entities([LocalBridgeControlButton(coordinator, action) for action in ("start", "pause")])
+            async_add_entities([LocalBridgeControlButton(coordinator, action) for action in ("start", "pause", "dock")])
         return
     coordinator: DreameVacuumDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
 
@@ -530,13 +530,13 @@ class DreameVacuumShortcutButtonEntity(DreameVacuumEntity, ButtonEntity):
 
 
 class LocalBridgeControlButton(LocalBridgeEntity, ButtonEntity):
-    """Explicit start/pause buttons using the authenticated local bridge."""
+    """Explicit start/pause/dock buttons using the authenticated local bridge."""
 
     def __init__(self, coordinator, action: str) -> None:
         super().__init__(coordinator, f"local_{action}")
         self._action = action
-        self._attr_name = "Start cleaning" if action == "start" else "Pause"
-        self._attr_icon = "mdi:play" if action == "start" else "mdi:pause"
+        self._attr_name = {"start": "Start cleaning", "pause": "Pause", "dock": "Return to dock"}[action]
+        self._attr_icon = {"start": "mdi:play", "pause": "mdi:pause", "dock": "mdi:home-import-outline"}[action]
 
     async def async_press(self) -> None:
         await self.coordinator.async_control(self._action, self._context)

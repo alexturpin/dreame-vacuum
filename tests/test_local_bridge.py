@@ -1884,33 +1884,34 @@ async def _load_control_entry(hass, bridge):
     })
 
 
-async def test_local_start_pause_buttons_work_without_a_solicited_snapshot(hass, run_bridge, hass_admin_user):
+async def test_local_control_buttons_work_without_a_solicited_snapshot(hass, run_bridge, hass_admin_user):
     entry, coordinator = await _load_control_entry(hass, run_bridge)
     assert hass.states.get(_VACUUM).state == STATE_UNAVAILABLE
     context = Context(user_id=hass_admin_user.id)
-    for action, entity in (("start", "button.bridge_test_start_cleaning"), ("pause", "button.bridge_test_pause")):
+    for action, entity in (("start", "button.bridge_test_start_cleaning"), ("pause", "button.bridge_test_pause"), ("dock", "button.bridge_test_return_to_dock")):
         assert hass.states.get(entity).state != STATE_UNAVAILABLE
         await hass.services.async_call("button", "press", {"entity_id": entity}, blocking=True, context=context)
         assert run_bridge.actions[-1]["action"] == action
-    assert len(run_bridge.actions) == 2
+    assert len(run_bridge.actions) == 3
     assert not run_bridge.posts and not run_bridge.claims
     assert await hass.config_entries.async_unload(entry.entry_id)
     assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
-    assert len(run_bridge.actions) == 2  # Reload does not initiate movement.
+    assert len(run_bridge.actions) == 3  # Reload does not initiate movement.
 
 
 @pytest.mark.parametrize("fault", ["identity", "rejected", "http"])
-async def test_local_action_failure_does_not_retry(hass, run_bridge, hass_admin_user, fault):
+@pytest.mark.parametrize("action", ["start", "dock"])
+async def test_local_action_failure_does_not_retry(hass, run_bridge, hass_admin_user, fault, action):
     _, coordinator = await _load_control_entry(hass, run_bridge)
     run_bridge.action_fault = fault
     with pytest.raises(HomeAssistantError):
-        await coordinator.async_control("start", Context(user_id=hass_admin_user.id))
+        await coordinator.async_control(action, Context(user_id=hass_admin_user.id))
     assert len(run_bridge.actions) == 1
     assert coordinator._action_busy is False
     run_bridge.action_fault = None
     await coordinator.async_control("pause", Context(user_id=hass_admin_user.id))
-    assert [p["action"] for p in run_bridge.actions] == ["start", "pause"]
+    assert [p["action"] for p in run_bridge.actions] == [action, "pause"]
 
 
 async def test_local_controls_reject_internal_automated_and_non_admin_calls(hass, run_bridge, hass_admin_user):

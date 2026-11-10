@@ -220,3 +220,12 @@ A missing response is an unknown outcome: check the robot rather than assuming
 it did not move. These buttons are not an emergency stop. Startup, reconnect,
 reload and passive polling never send actions. The vacuum entity itself retains
 zero control features; use these buttons, not legacy upstream vacuum services.
+
+### Return to dock (local.8)
+
+On-demand entries also expose **Return to dock**. It uses the same direct-admin
+button path with the fixed action name `dock`; the bridge maps that to MIoT
+CHARGE (`siid=3`, `aiid=1`, no input parameters). Like Pause, it cancels an
+unfinished state refresh. It does not call upstream `return_to_base()`, issue
+ancillary writes, or retry. Docking acceptance must be verified separately on
+the target robot; a successful action reply alone does not establish arrival.

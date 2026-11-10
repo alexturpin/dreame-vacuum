@@ -339,7 +339,7 @@ class LocalBridgeClient:
 
     async def async_action(self, epoch: str, action: str) -> None:
         """One fixed movement command, with no retry or ancillary robot requests."""
-        if action not in ("start", "pause") or not _is_hex_id(epoch):
+        if action not in ("start", "pause", "dock") or not _is_hex_id(epoch):
             raise LocalBridgeError("Invalid local action")
         request = {"version": 1, "request_id": token_hex(16), "epoch": epoch, "action": action}
         reply = await self._request("POST", "/v1/action", 6, request)
@@ -592,7 +592,7 @@ class LocalBridgeCoordinator(DataUpdateCoordinator[DreameVacuumDevice]):
         user = await self.hass.auth.async_get_user(context.user_id)
         if user is None or not user.is_admin:
             raise LocalBridgeError("Movement requires an administrator")
-        if self._read_mode != READ_MODE_ON_DEMAND or action not in ("start", "pause"):
+        if self._read_mode != READ_MODE_ON_DEMAND or action not in ("start", "pause", "dock"):
             raise LocalBridgeError("Local control is unavailable")
         if self._closed or self._epoch is None or not self.device.available:
             raise LocalBridgeError("Robot is unavailable")
