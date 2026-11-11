@@ -66,6 +66,7 @@ class DreameLocalMapManager(DreameMapVacuumMapManager):
         self._loaded_lists = {}
         self._list_retry_at = 0.0
         self._map_request_at = 0.0
+        self._last_frame_received_at = None
         self._last_gap = None
 
     def reset_session(self):
@@ -78,6 +79,7 @@ class DreameLocalMapManager(DreameMapVacuumMapManager):
             self._loaded_lists.clear()
             self._list_retry_at = 0.0
             self._map_request_at = 0.0
+            self._last_frame_received_at = None
             self._last_gap = None
             self._device_running = self._device_docked = False
             self._ready = False
@@ -219,33 +221,32 @@ class DreameLocalMapManager(DreameMapVacuumMapManager):
             for frame in frames.values():
                 frame.timestamp_ms = shift(frame.timestamp_ms)
 
-    def _ingest_frame(self, raw, timestamp, key=None):
+    def _ingest_frame(self, raw, timestamp, key=None) -> bool | None:
+        """Return whether a valid frame changed the live map, or None on failure."""
         if not isinstance(raw, str) or not 0 < len(raw) <= _MAX_MAP_OBJECT_BYTES:
-            return False
+            return None
         watermark = self._latest_map_timestamp_ms, self._latest_map_id
         uptime_offset = self._uptime_offset_ms
         try:
             fingerprint = sha256((raw + "," + (key or "")).encode()).digest()
             if fingerprint in self._recent_frames:
                 return False
-            self._recent_frames.append(fingerprint)
-            self._recent_frames = self._recent_frames[-32:]
             decoder = DreameVacuumMapDecoder
             partial = decoder.decode_map_partial(raw, self.map_version, self._aes_iv, key)
             if partial is None or partial.frame_type not in (MapFrameType.I.value, MapFrameType.P.value):
-                return False
+                return None
             width = decoder._read_int_16_le(partial.raw, 19)
             height = decoder._read_int_16_le(partial.raw, 21)
             pixels_end = decoder.HEADER_SIZE + width * height
             if len(partial.raw) < pixels_end:
                 _LOGGER.warning("Ignoring a local map frame with incomplete pixels")
-                return False
+                return None
             # The native decoder uses {} for both absent/empty metadata and
             # metadata it could not parse. Resolve that ambiguity when bytes exist.
             if len(partial.raw) > pixels_end and not partial.data_json:
                 if json.loads(partial.raw[pixels_end:].decode("utf8")) != {}:
                     _LOGGER.warning("Ignoring a local map frame with invalid metadata")
-                    return False
+                    return None
 
             partial.timestamp_ms = self._frame_timestamp(partial.timestamp_ms, timestamp)
             if self._latest_map_timestamp_ms is None or partial.timestamp_ms > self._latest_map_timestamp_ms:
@@ -257,13 +258,20 @@ class DreameLocalMapManager(DreameMapVacuumMapManager):
             self._latest_map_timestamp_ms, self._latest_map_id = watermark
             self._uptime_offset_ms = uptime_offset
             _LOGGER.warning("Ignoring an invalid local map frame")
-            return False
+            return None
+        self._recent_frames.append(fingerprint)
+        self._recent_frames = self._recent_frames[-32:]
         changed = before != (self._current_map_id, self._current_frame_id, self._current_timestamp_ms)
         if isinstance(partial.timestamp_ms, _ProjectedUptime) and (
             changed or partial.timestamp_ms == self._latest_map_timestamp_ms
         ):
             self._bound_uptime_projection(partial.timestamp_ms)
         if changed:
+            if self._map_data is not None and self._current_frame_id is not None:
+                # Renderer invalidation also changes MapData.last_updated. Only
+                # accepted robot frames may reset the live-map recovery clock.
+                self._last_frame_received_at = time.monotonic()
+                self._delete_invalid_partial_maps()
             self._revision += 1
         return changed
 
@@ -271,15 +279,19 @@ class DreameLocalMapManager(DreameMapVacuumMapManager):
         object_name, _, key = reference.partition(",")
         if not _is_object_name(object_name) or len(key) > 256:
             return
+        # Temporary names are reused. A report may precede the new upload,
+        # leaving the previous ciphertext at the same address for this fetch.
+        self._pending_object = (reference, timestamp)
         response = self._get_interim_file_data(object_name)
         if response is None:
-            self._pending_object = (reference, timestamp)
             return
-        self._pending_object = None
         try:
-            self._ingest_frame(response.decode("ascii"), timestamp, key or None)
+            raw = response.decode("ascii")
         except UnicodeError:
             _LOGGER.warning("Ignoring a local map object with invalid encoding")
+            return
+        if self._ingest_frame(raw, timestamp, key or None) is not None:
+            self._pending_object = None
 
     def ingest_properties(self, rows):
         properties = {
@@ -383,8 +395,8 @@ class DreameLocalMapManager(DreameMapVacuumMapManager):
                 or self._need_map_request
                 or (self._device_running and (
                     self._map_data is None
-                    or not self._map_data.last_updated
-                    or time.time() - self._map_data.last_updated > 30
+                    or self._last_frame_received_at is None
+                    or now - self._last_frame_received_at > 30
                 ))
             )
             if not needs_frame:

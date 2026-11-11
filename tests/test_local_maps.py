@@ -16,6 +16,7 @@ from PIL import Image
 import pytest
 
 from custom_components.dreame_vacuum.const import DOMAIN
+from custom_components.dreame_vacuum.dreame import local_map
 from custom_components.dreame_vacuum.dreame.local_map import DreameLocalMapManager
 from custom_components.dreame_vacuum.dreame.map import (
     DreameMapVacuumMapManager,
@@ -108,6 +109,35 @@ def test_live_map_from_encrypted_upload_reaches_native_renderer():
     renderer = DreameVacuumMapDataJsonRenderer()
     assert renderer.render_map(result) != renderer.default_map_image
     assert protocol.requests == []
+
+
+def test_reused_map_slot_retries_old_ciphertext_until_replaced(monkeypatch):
+    manager, protocol = setup_manager()
+    elapsed = 100
+    clock = SimpleNamespace(time=lambda: NOW_MS / 1000 + elapsed, monotonic=lambda: elapsed)
+    monkeypatch.setattr(local_map, "time", clock)
+    protocol.objects[OBJECT] = frame(key=KEY).encode()
+    manager.ingest_properties([row(3, f"{OBJECT},{KEY}")])
+    assert manager.get_map().frame_id == 1
+
+    # The next report can arrive before the upload replaces the old ciphertext.
+    new_key = "new-synthetic-key"
+    report = [row(13, f"1,{OBJECT},{new_key}"), row(5, NOW_MS + 1)]
+    manager.ingest_properties(report)
+    assert manager.get_map().frame_id == 1
+    assert protocol.fetched == [OBJECT, OBJECT]
+
+    protocol.objects[OBJECT] = frame(2, timestamp=NOW_MS + 1, key=new_key).encode()
+    elapsed += 5
+    manager.update()
+    assert manager.get_map().frame_id == 2
+    assert protocol.fetched == [OBJECT, OBJECT, OBJECT]
+
+    manager.ingest_properties(report)
+    assert protocol.fetched == [OBJECT, OBJECT, OBJECT, OBJECT]
+    elapsed += 5
+    manager.update()
+    assert protocol.fetched == [OBJECT, OBJECT, OBJECT, OBJECT]
 
 
 def test_explicit_request_uses_native_action_and_ingests_output():
@@ -307,6 +337,55 @@ def test_poll_requests_bounded_gap_repair():
     manager.update()
     assert protocol.repair_requests == [{"req_type": 1, "frame_type": "P", "map_id": 7, "frame_id": 2}]
     assert manager.get_map().frame_id == 3
+
+
+def test_full_gap_repair_clears_superseded_deltas(monkeypatch):
+    manager, protocol = setup_manager()
+    elapsed = 100
+    clock = SimpleNamespace(time=lambda: NOW_MS / 1000 + elapsed, monotonic=lambda: elapsed)
+    monkeypatch.setattr(local_map, "time", clock)
+    monkeypatch.setattr("custom_components.dreame_vacuum.dreame.map.time", clock)
+    manager.set_device_running(True, False)
+    manager.ingest_properties([row(1, frame(98))])
+    manager.ingest_properties([row(1, frame(343, "P", timestamp=NOW_MS + 1, pixels=bytes(64)))])
+
+    manager.update()
+    assert protocol.repair_requests == [{"req_type": 1, "frame_type": "P", "map_id": 7, "frame_id": 99}]
+    assert manager.get_map().frame_id == 98
+
+    elapsed += 10
+    protocol.out = [{"piid": 13, "value": f"0,{frame(344, timestamp=NOW_MS + 10000, robot=(100, 50))}"}]
+    manager.update()
+    assert protocol.repair_requests[-1] == {"req_type": 1, "frame_type": "I", "force_type": 1}
+    assert manager.get_map().frame_id == 344
+
+    elapsed += 10
+    manager.update()
+    assert len(protocol.repair_requests) == 2
+
+
+def test_render_refresh_does_not_delay_stalled_live_map_request(monkeypatch):
+    manager, protocol = setup_manager()
+    clock = SimpleNamespace(time=lambda: NOW_MS / 1000 + elapsed, monotonic=lambda: elapsed)
+    elapsed = 100
+    monkeypatch.setattr(local_map, "time", clock)
+    monkeypatch.setattr("custom_components.dreame_vacuum.dreame.map.time", clock)
+    manager.set_device_running(True, False)
+    manager.ingest_properties([row(1, frame())])
+
+    elapsed += 29
+    manager.update()
+    assert protocol.repair_requests == []
+
+    # Device status listeners invalidate the renderer without receiving a frame.
+    manager.editor.refresh_map()
+    assert manager.get_map().frame_id == 1
+    elapsed += 2
+    protocol.out = [{"piid": 1, "value": frame(2, timestamp=NOW_MS + 31000, robot=(100, 50))}]
+    manager.update()
+
+    assert protocol.repair_requests == [{"req_type": 1, "frame_type": "I", "force_type": 1}]
+    assert manager.get_map().frame_id == 2
 
 
 def test_map_list_and_history_reuse_tasshack_objects():
