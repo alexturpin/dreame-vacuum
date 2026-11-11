@@ -325,11 +325,18 @@ class DreameVacuumEntity(CoordinatorEntity[DreameVacuumDataUpdateCoordinator]):
     def device_info(self) -> DeviceInfo:
         """Return device information about this Dreame Vacuum device."""
         if self.device._local_candidate:
+            info = self.device.info
+            versions = {}
+            if info.firmware_version is not None:
+                versions["sw_version"] = info.firmware_version
+            if info.hardware_version is not None:
+                versions["hw_version"] = info.hardware_version
             return DeviceInfo(
                 identifiers={(DOMAIN, self.device.mac)},
                 name=self.device.name,
                 manufacturer="Dreame",
-                model=self.device.info.model,
+                model=info.model,
+                **versions,
             )
         if self.device.info:
             return DeviceInfo(

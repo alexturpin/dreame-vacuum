@@ -661,7 +661,9 @@ SENSORS: tuple[DreameVacuumSensorEntityDescription, ...] = (
     DreameVacuumSensorEntityDescription(
         key="firmware_version",
         icon="mdi:chip",
-        value_fn=lambda value, entity: entity.device.info.version,
+        value_fn=lambda value, entity: (
+            entity.device.info.firmware_version if entity.device._local_candidate else entity.device.info.version
+        ),
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
 )

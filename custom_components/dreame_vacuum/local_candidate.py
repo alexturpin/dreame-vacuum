@@ -19,10 +19,11 @@ from yarl import URL
 
 from homeassistant.const import CONF_NAME, EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import callback
+from homeassistant.helpers import device_registry
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import UpdateFailed
 
-from .const import LOGGER
+from .const import DOMAIN, LOGGER
 from .coordinator import DreameVacuumDataUpdateCoordinator
 from .dreame import (
     DeviceException, DreameVacuumAIProperty, DreameVacuumAutoSwitchProperty, DreameVacuumDevice,
@@ -150,6 +151,37 @@ def _property_rows(rows, expected=None, *, require_complete=False):
     return result
 
 
+def _metadata_text(value, max_bytes):
+    return type(value) is str and value.isprintable() and 0 < len(value.encode("utf-8")) <= max_bytes
+
+
+def _device_info(data):
+    error = "Invalid local device information"
+    if type(data) is not dict or data.keys() - {"model", "fw_ver", "hw_ver", "ap", "netif"}:
+        raise LocalBridgeError(error)
+    if "model" in data and data["model"] != MODEL:
+        raise LocalBridgeError(error)
+    if any(not _metadata_text(data[key], 64) for key in ("fw_ver", "hw_ver") if key in data):
+        raise LocalBridgeError(error)
+    if "ap" in data:
+        ap = data["ap"]
+        if (
+            type(ap) is not dict or not ap or ap.keys() - {"ssid", "rssi"}
+            or ("ssid" in ap and not _metadata_text(ap["ssid"], 32))
+            or ("rssi" in ap and (type(ap["rssi"]) is not int or not -127 <= ap["rssi"] <= 0))
+        ):
+            raise LocalBridgeError(error)
+    if "netif" in data:
+        netif = data["netif"]
+        if type(netif) is not dict or netif.keys() != {"localIp"} or type(netif["localIp"]) is not str:
+            raise LocalBridgeError(error)
+        try:
+            IPv4Address(netif["localIp"])
+        except ValueError:
+            raise LocalBridgeError(error) from None
+    return data
+
+
 @dataclass(frozen=True)
 class CandidateSnapshot:
     epoch: str | None
@@ -158,6 +190,7 @@ class CandidateSnapshot:
     rows: dict[str, dict]
     history: list
     map_reports: dict[int, list[dict]]
+    device_info: dict = field(default_factory=dict)
 
 
 class CandidateBridgeClient(LocalBridgeClient):
@@ -174,10 +207,11 @@ class CandidateBridgeClient(LocalBridgeClient):
             max_bytes=_RESPONSE_LIMIT, service_errors=_STATE_SERVICE_ERRORS,
         )
         fields = {"version", "epoch", "connected", "ready", "sequence", "properties", "history", "map_reports"}
-        if data.keys() != fields:
+        if data.keys() - {"device_info"} != fields:
             raise LocalBridgeError("Invalid candidate state envelope")
         epoch, ready, connected, sequence = data["epoch"], data["ready"], data["connected"], data["sequence"]
         rows = _property_rows(data["properties"])
+        device_info = _device_info(data.get("device_info", {}))
         history = data["history"]
         if type(history) is not list or len(history) > 100 or any(
             type(event) is not dict or event.keys() != {"did", "siid", "eiid", "arguments"}
@@ -195,7 +229,7 @@ class CandidateBridgeClient(LocalBridgeClient):
             or type(sequence) is not int
             or not 0 <= sequence <= _MAX_SEQUENCE
             or (connected and not _is_hex_id(epoch))
-            or (not connected and (epoch is not None or ready))
+            or (not connected and (epoch is not None or ready or device_info))
             or (not ready and (rows or sequence))
             or (rows and not sequence)
         ):
@@ -214,7 +248,7 @@ class CandidateBridgeClient(LocalBridgeClient):
                 raise LocalBridgeError("Invalid local map report")
             map_reports[number] = list(map_rows.values())
             previous = number
-        return CandidateSnapshot(epoch, ready, sequence, rows, history, map_reports)
+        return CandidateSnapshot(epoch, ready, sequence, rows, history, map_reports, device_info)
 
     async def async_map_object(self, name: str) -> bytes | None:
         if not isinstance(name, str) or not _OBJECT.fullmatch(name):
@@ -365,8 +399,6 @@ class CandidateProtocol:
         if action is not None:
             return action.name in _SUPPORTED_ACTIONS
         prop, key = description.property_key, description.key
-        if key == "firmware_version":
-            return False  # No robot info RPC in the candidate contract.
         if domain == "button":
             return key in ("start_fast_mapping", "start_mapping", "clear_warning", "backup_saved_map")
         if domain in ("switch", "select", "number", "time"):
@@ -539,6 +571,7 @@ class LocalCandidateCoordinator(DreameVacuumDataUpdateCoordinator):
         rows = {}
         history = None
         map_reports = []
+        device_info = snapshot.device_info
         if snapshot.history != self._history:
             history = self._history = snapshot.history
         now = self.hass.loop.time()
@@ -599,6 +632,9 @@ class LocalCandidateCoordinator(DreameVacuumDataUpdateCoordinator):
                     rows.clear()
                     map_reports.clear()
                     bootstrap = True
+                    device_info = {}
+                else:
+                    device_info = current.device_info
 
         self._initialized = self._initialized or self.protocol.connected
         for did, row in rows.items():
@@ -614,6 +650,7 @@ class LocalCandidateCoordinator(DreameVacuumDataUpdateCoordinator):
         stale = {did for did, seen in self._seen.items() if now - seen > (25 if P(int(did)) in _CORE_PROPERTIES else 150)}
         for did in stale:
             del self._seen[did]
+        old_info = self.device.info
         await self.hass.async_add_executor_job(
             self.device.apply_local_candidate_properties,
             [row for did, row in rows.items() if did in self._seen],
@@ -622,13 +659,31 @@ class LocalCandidateCoordinator(DreameVacuumDataUpdateCoordinator):
             history,
             map_reports,
             ZoneInfo(self.hass.config.time_zone),
+            device_info,
         )
+        if self.device.info is not old_info:
+            self._update_device_versions()
         if self._goto is not None:
             self._goto_update.set()
         if state_failure is not None:
             # Candidate state errors carry fixed local text, including mapped 503 replies.
             raise UpdateFailed(f"Local bridge state unavailable. {state_failure}") from None
         return self.device
+
+    def _update_device_versions(self):
+        info = self.device.info
+        versions = {
+            key: value for key, value in (
+                ("sw_version", info.firmware_version), ("hw_version", info.hardware_version),
+            ) if value is not None
+        }
+        if not versions:
+            return
+        registry = device_registry.async_get(self.hass)
+        for entry in device_registry.async_entries_for_config_entry(registry, self._entry.entry_id):
+            if (DOMAIN, self.device.mac) in entry.identifiers:
+                registry.async_update_device(entry.id, **versions)
+                break
 
     async def async_execute_command(self, func: Callable, *args, **kwargs):
         """Serialize a native user command with observations and require a reply."""

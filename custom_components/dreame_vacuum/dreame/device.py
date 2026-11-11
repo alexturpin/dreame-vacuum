@@ -524,7 +524,7 @@ class DreameVacuumDevice:
         if self._local_candidate:
             from .local_map import DreameLocalMapManager
 
-            self.info = DreameVacuumDeviceInfo({"model": "dreame.vacuum.r2250"})
+            self.info = DreameVacuumDeviceInfo({"model": "dreame.vacuum.r2250", "hw_ver": None})
             self._protocol = local_candidate_protocol
             self._map_manager = DreameLocalMapManager(self._protocol)
             self._map_manager.listen(self._map_changed, self._map_updated)
@@ -567,10 +567,15 @@ class DreameVacuumDevice:
         self.data.update(properties)
         self.available = bool(self.data)
 
-    def apply_local_candidate_properties(self, rows, current_dids, reset, history, map_reports, timezone) -> None:
+    def apply_local_candidate_properties(
+        self, rows, current_dids, reset, history, map_reports, timezone, device_info=None,
+    ) -> None:
         """Apply observations without entering the upstream cloud/poll lifecycle."""
         if not self._local_candidate:
             raise RuntimeError("Local candidate protocol required")
+        info = {"model": self.info.model, "hw_ver": None, **(device_info or {})}
+        if info != self.info.raw:
+            self.info = DreameVacuumDeviceInfo(info)
         if reset:
             self._map_manager.reset_session()
             self._dirty_data.clear()
@@ -11394,8 +11399,11 @@ class DreameVacuumDeviceStatus:
 
         if self._capability.shortcuts:
             attributes[ATTR_SHORTCUT_TASK] = self.shortcut_task
-        attributes[ATTR_FIRMWARE_VERSION] = str(self._device.info.version)
-        attributes[ATTR_AP] = self._device.info.ap
+        info = self._device.info
+        attributes[ATTR_FIRMWARE_VERSION] = info.firmware_version if self._device._local_candidate else str(info.version)
+        attributes[ATTR_AP] = info.ap
+        if self._device._local_candidate and info.ap is None and info.ip_address is not None:
+            attributes[ATTR_AP] = {"ip": info.ip_address}
         attributes[ATTR_LAST_UPDATED_TIME] = self._last_updated_time
         capability_list = self._capability.list
         if self._capability.walls and "walls" not in capability_list:
@@ -11430,7 +11438,11 @@ class DreameVacuumDeviceInfo:
         if firmware_version is not None:
             firmware_version = firmware_version.split("_")
             if len(firmware_version) == 2:
-                self.version = int(firmware_version[1])
+                try:
+                    self.version = int(firmware_version[1])
+                except ValueError:
+                    # Firmware labels without a numeric build remain displayable.
+                    pass
 
     def __repr__(self):
         return "%s v%s (%s) @ %s - token: %s" % (

@@ -1937,6 +1937,7 @@ class FakeCandidateBridge(FakeBridge):
     push: list[dict] = field(default_factory=list)
     map_reports: list[dict] = field(default_factory=list)
     history: list[dict] = field(default_factory=list)
+    device_info: dict | None = None
 
     async def candidate_state(self, request):
         assert request.headers["Authorization"] == f"Bearer {self.token}"
@@ -1945,6 +1946,7 @@ class FakeCandidateBridge(FakeBridge):
             "ready": self.epoch is not None,
             "sequence": self.sequence, "properties": self.push,
             "history": self.history, "map_reports": self.map_reports,
+            **({"device_info": self.device_info} if self.device_info is not None else {}),
         })
 
     async def rpc(self, request):
