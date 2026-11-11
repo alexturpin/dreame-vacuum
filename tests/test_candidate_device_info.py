@@ -5,9 +5,11 @@ import pytest
 from homeassistant.const import STATE_UNKNOWN, STATE_UNAVAILABLE
 from homeassistant.helpers import device_registry, entity_registry
 
+from custom_components.dreame_vacuum.const import DOMAIN
 from custom_components.dreame_vacuum.local_bridge import LocalBridgeError
 
 from test_local_bridge import (
+    _EPOCH,
     _VACUUM,
     _load_entry,
     _refresh,
@@ -65,9 +67,61 @@ async def test_late_metadata_updates_vacuum_firmware_sensor_and_registry(hass, c
     await _refresh(hass, coordinator)
 
     assert hass.states.get(FIRMWARE_SENSOR).state == STATE_UNAVAILABLE
+    assert coordinator.device.info.firmware_version == "4.3.3_1021"
+    assert coordinator.device.info.hardware_version == "Linux"
     assert coordinator.device.info.ap is None
+    assert coordinator.device.info.ip_address is None
     assert vacuum_registry_entry(hass).sw_version == "4.3.3_1021"
     assert candidate_bridge.posts == []
+
+    candidate_bridge.epoch = "9" * len(_EPOCH)
+    await _refresh(hass, coordinator)
+
+    assert hass.states.get(FIRMWARE_SENSOR).state == "4.3.3_1021"
+    assert hass.states.get(_VACUUM).attributes["ap"] is None
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_setup_restores_registry_versions_and_prefers_fresh_reports(hass, candidate_bridge):
+    candidate_bridge.device_info = METADATA
+    entry, first_coordinator = await _load_entry(hass, candidate_bridge, bridge_read_mode="local_candidate")
+    device_id = vacuum_registry_entry(hass).id
+
+    candidate_bridge.device_info = {}
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+    coordinator = hass.data[DOMAIN][entry.entry_id]
+    assert coordinator is not first_coordinator
+    assert hass.states.get(FIRMWARE_SENSOR).state == "4.3.3_1021"
+    assert hass.states.get(_VACUUM).attributes["firmware_version"] == "4.3.3_1021"
+    assert hass.states.get(_VACUUM).attributes["ap"] is None
+    assert coordinator.device.info.hardware_version == "Linux"
+    assert coordinator.device.info.ip_address is None
+
+    candidate_bridge.device_info = {"fw_ver": "4.3.3_1038"}
+    await _refresh(hass, coordinator)
+
+    assert hass.states.get(FIRMWARE_SENSOR).state == "4.3.3_1038"
+    assert hass.states.get(_VACUUM).attributes["firmware_version"] == "4.3.3_1038"
+    registered = vacuum_registry_entry(hass)
+    assert registered.id == device_id
+    assert registered.sw_version == "4.3.3_1038"
+    assert registered.hw_version == "Linux"
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+async def test_setup_ignores_invalid_registry_versions(hass, candidate_bridge):
+    entry, _ = await _load_entry(hass, candidate_bridge, bridge_read_mode="local_candidate")
+    device_registry.async_get(hass).async_update_device(
+        vacuum_registry_entry(hass).id, sw_version="é" * 33, hw_version="Linux\n",
+    )
+
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    assert hass.states.get(FIRMWARE_SENSOR).state == STATE_UNKNOWN
+    assert hass.states.get(_VACUUM).attributes["firmware_version"] is None
+    assert hass.data[DOMAIN][entry.entry_id].device.info.hardware_version is None
     assert await hass.config_entries.async_unload(entry.entry_id)
 
 

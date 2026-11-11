@@ -35,6 +35,7 @@ from .local_bridge import (
 )
 
 MODEL = "dreame.vacuum.r2250"
+_DEVICE_VERSION_FIELDS = {"fw_ver": "sw_version", "hw_ver": "hw_version"}
 _STATE_INTERVAL = 3
 _STATE_HTTP_TIMEOUT = 4  # Allow delivery after the bridge's three-second owner deadline.
 _STATE_SERVICE_ERRORS = {
@@ -161,7 +162,7 @@ def _device_info(data):
         raise LocalBridgeError(error)
     if "model" in data and data["model"] != MODEL:
         raise LocalBridgeError(error)
-    if any(not _metadata_text(data[key], 64) for key in ("fw_ver", "hw_ver") if key in data):
+    if any(not _metadata_text(data[key], 64) for key in _DEVICE_VERSION_FIELDS if key in data):
         raise LocalBridgeError(error)
     if "ap" in data:
         ap = data["ap"]
@@ -571,7 +572,7 @@ class LocalCandidateCoordinator(DreameVacuumDataUpdateCoordinator):
         rows = {}
         history = None
         map_reports = []
-        device_info = snapshot.device_info
+        device_info = snapshot.device_info.copy()
         if snapshot.history != self._history:
             history = self._history = snapshot.history
         now = self.hass.loop.time()
@@ -632,9 +633,16 @@ class LocalCandidateCoordinator(DreameVacuumDataUpdateCoordinator):
                     rows.clear()
                     map_reports.clear()
                     bootstrap = True
-                    device_info = {}
+                    device_info = {
+                        key: current.device_info[key] for key in _DEVICE_VERSION_FIELDS if key in current.device_info
+                    }
                 else:
-                    device_info = current.device_info
+                    device_info = current.device_info.copy()
+                # A validated announcement can still identify the firmware when
+                # the session ends between the initial and final snapshots.
+                for key in _DEVICE_VERSION_FIELDS:
+                    if key in snapshot.device_info:
+                        device_info.setdefault(key, snapshot.device_info[key])
 
         self._initialized = self._initialized or self.protocol.connected
         for did, row in rows.items():
@@ -651,6 +659,20 @@ class LocalCandidateCoordinator(DreameVacuumDataUpdateCoordinator):
         for did in stale:
             del self._seen[did]
         old_info = self.device.info
+        registry = device_registry.async_get(self.hass)
+        registered = next((
+            entry for entry in device_registry.async_entries_for_config_entry(registry, self._entry.entry_id)
+            if (DOMAIN, self.device.mac) in entry.identifiers
+        ), None)
+        # Version fields survive reconnects and reloads. Network metadata is
+        # supplied only by the current bridge session.
+        for key, field in _DEVICE_VERSION_FIELDS.items():
+            if key not in device_info:
+                value = old_info.raw.get(key)
+                if value is None and registered is not None:
+                    value = getattr(registered, field)
+                if _metadata_text(value, 64):
+                    device_info[key] = value
         await self.hass.async_add_executor_job(
             self.device.apply_local_candidate_properties,
             [row for did, row in rows.items() if did in self._seen],
@@ -661,29 +683,19 @@ class LocalCandidateCoordinator(DreameVacuumDataUpdateCoordinator):
             ZoneInfo(self.hass.config.time_zone),
             device_info,
         )
-        if self.device.info is not old_info:
-            self._update_device_versions()
+        if registered is not None and self.device.info is not old_info:
+            versions = {
+                field: device_info[key] for key, field in _DEVICE_VERSION_FIELDS.items()
+                if key in device_info and device_info[key] != getattr(registered, field)
+            }
+            if versions:
+                registry.async_update_device(registered.id, **versions)
         if self._goto is not None:
             self._goto_update.set()
         if state_failure is not None:
             # Candidate state errors carry fixed local text, including mapped 503 replies.
             raise UpdateFailed(f"Local bridge state unavailable. {state_failure}") from None
         return self.device
-
-    def _update_device_versions(self):
-        info = self.device.info
-        versions = {
-            key: value for key, value in (
-                ("sw_version", info.firmware_version), ("hw_version", info.hardware_version),
-            ) if value is not None
-        }
-        if not versions:
-            return
-        registry = device_registry.async_get(self.hass)
-        for entry in device_registry.async_entries_for_config_entry(registry, self._entry.entry_id):
-            if (DOMAIN, self.device.mac) in entry.identifiers:
-                registry.async_update_device(entry.id, **versions)
-                break
 
     async def async_execute_command(self, func: Callable, *args, **kwargs):
         """Serialize a native user command with observations and require a reply."""
